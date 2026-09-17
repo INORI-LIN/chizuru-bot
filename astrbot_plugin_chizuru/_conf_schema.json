@@ -2,7 +2,7 @@
   "platform_id": {
     "type": "string",
     "description": "目标 OneBot 平台连接实例 ID",
-    "hint": "空值拒绝全部。本骨架不发送消息，也不放行后续模型调用；仅供专用离线开发实例使用。",
+    "hint": "空值拒绝全部。必须与事件的平台连接实例一致。",
     "default": ""
   },
   "self_id": {
@@ -13,8 +13,149 @@
   },
   "allowed_group_ids": {
     "type": "list",
-    "description": "允许分类的 QQ 群 ID 列表",
-    "hint": "使用字符串群号；空列表拒绝全部。配置不启用聊天、采集或长期记忆。",
+    "description": "允许处理的 QQ 群 ID 列表",
+    "hint": "使用字符串群号；空列表拒绝全部。未列出的群不聊天、不采集、不发提示。",
     "default": []
+  },
+  "group_maintainers": {
+    "type": "dict",
+    "description": "群 ID 到已授权维护者 QQ 号的映射",
+    "hint": "形如 {\"20001\": [\"30001\"]}。这是显式配置授权；QQ 群管理员身份不自动生效。",
+    "default": {}
+  },
+  "notice_version": {
+    "type": "string",
+    "description": "本部署使用的群告知文案版本",
+    "hint": "与附录 C.1 的文案版本对应。改动文案必须递增版本并重新告知。",
+    "default": "notice-1"
+  },
+  "context_buffer_max_messages": {
+    "type": "int",
+    "description": "每群普通群聊缓冲条数上限",
+    "hint": "与 TTL 取更严格者。只在内存，重启丢弃。",
+    "default": 30
+  },
+  "context_buffer_ttl_seconds": {
+    "type": "int",
+    "description": "普通群聊缓冲有效期（秒）",
+    "default": 600
+  },
+  "interaction_history_max_turns": {
+    "type": "int",
+    "description": "每群 @ 互动历史轮数上限",
+    "hint": "框架默认不限轮数，必须在此显式限制，否则共享历史会无限增长。",
+    "default": 20
+  },
+  "interaction_history_ttl_hours": {
+    "type": "int",
+    "description": "@ 互动历史有效期（小时）",
+    "hint": "框架无原生 TTL，过期清理由插件负责。",
+    "default": 24
+  },
+  "memory_max_records_per_member": {
+    "type": "int",
+    "description": "每位成员长期记忆条数上限",
+    "default": 20
+  },
+  "memory_ttl_days": {
+    "type": "int",
+    "description": "长期记忆有效期（天）",
+    "hint": "到期停止检索并清除；检索不自动续期。",
+    "default": 90
+  },
+  "auth_confirm_ttl_seconds": {
+    "type": "int",
+    "description": "记忆授权确认的有效期（秒）",
+    "default": 300
+  },
+  "memory_extraction_enabled": {
+    "type": "bool",
+    "description": "是否允许自动记忆抽取",
+    "hint": "总开关。预算未配置时即使为 true 也不生效（见 require_budget_for_extraction）。",
+    "default": false
+  },
+  "input_token_budget": {
+    "type": "int",
+    "description": "单次模型输入上限（token）",
+    "default": 8192
+  },
+  "output_token_budget": {
+    "type": "int",
+    "description": "单次输出上限（token）",
+    "default": 512
+  },
+  "daily_budget_amount": {
+    "type": "float",
+    "description": "日预算金额",
+    "hint": "0 表示未配置：此时自动记忆抽取保持关闭，而不是不限额度。",
+    "default": 0
+  },
+  "monthly_budget_amount": {
+    "type": "float",
+    "description": "月预算金额",
+    "hint": "0 表示未配置。",
+    "default": 0
+  },
+  "require_budget_for_extraction": {
+    "type": "bool",
+    "description": "预算未配置时是否禁止自动抽取",
+    "hint": "设计基线：保持 true。改为 false 相当于在无额度控制下开放付费调用。",
+    "default": true
+  },
+  "provider_concurrency_global": {
+    "type": "int",
+    "description": "全局模型并发上限",
+    "hint": "聊天与抽取共同计入。",
+    "default": 2
+  },
+  "provider_concurrency_per_group": {
+    "type": "int",
+    "description": "同群模型并发上限",
+    "hint": "不得大于全局并发。",
+    "default": 1
+  },
+  "chat_queue_per_group": {
+    "type": "int",
+    "description": "每群聊天待处理上限",
+    "default": 3
+  },
+  "extraction_queue_global": {
+    "type": "int",
+    "description": "全局抽取待处理上限",
+    "default": 20
+  },
+  "schedule_wait_seconds": {
+    "type": "int",
+    "description": "未调度任务最长等待（秒）",
+    "hint": "超时即放弃，不持久化无限积压。",
+    "default": 30
+  },
+  "task_deadline_seconds": {
+    "type": "int",
+    "description": "单次业务期限（秒）",
+    "hint": "从接受任务起算，包含排队与重试；网络超时受其剩余时间约束。",
+    "default": 45
+  },
+  "connect_timeout_seconds": {
+    "type": "int",
+    "description": "连接超时（秒）",
+    "default": 5
+  },
+  "read_timeout_seconds": {
+    "type": "int",
+    "description": "读取超时（秒）",
+    "default": 30
+  },
+  "max_retries": {
+    "type": "int",
+    "description": "自动重试次数上限",
+    "hint": "仅适用暂时故障，且不重置总期限；需与 SDK 自带重试合并计算。",
+    "default": 1
+  },
+  "log_retention_days": {
+    "type": "int",
+    "description": "日志保留天数",
+    "hint": "只记类别、耗时、错误码与脱敏标识，不记聊天正文或密钥。",
+    "default": 7
   }
 }

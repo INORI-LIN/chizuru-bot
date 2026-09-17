@@ -61,6 +61,32 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(classify(replace(self.message, direct_text=text), self.settings), Classification.EMPTY_OR_UNSUPPORTED)
         self.assertEqual(classify(replace(self.message, mention_targets=()), self.settings), Classification.IGNORE)
 
+    def test_attachment_without_text_is_its_own_category(self):
+        # 需求 §4.1：@ 后只有图片/语音/文件时可回固定能力提示，与"空 @"不同档。
+        message = replace(self.message, direct_text="", has_attachment=True)
+        self.assertEqual(classify(message, self.settings), Classification.UNSUPPORTED_ATTACHMENT)
+
+    def test_text_wins_over_attachment(self):
+        message = replace(self.message, direct_text="看看这个", has_attachment=True)
+        self.assertEqual(classify(message, self.settings), Classification.TEXT_CANDIDATE)
+
+    def test_blank_text_with_attachment_is_still_attachment(self):
+        message = replace(self.message, direct_text="   ", has_attachment=True)
+        self.assertEqual(classify(message, self.settings), Classification.UNSUPPORTED_ATTACHMENT)
+
+    def test_attachment_does_not_bypass_trigger_rules(self):
+        for fields in (
+            {"mention_targets": ()},
+            {"mention_targets": ("all",)},
+            {"mention_targets": ("10002",)},
+            {"is_group": False},
+            {"group_id": "20002"},
+            {"sender_id": "10001"},
+        ):
+            with self.subTest(fields=fields):
+                message = replace(self.message, direct_text="", has_attachment=True, **fields)
+                self.assertEqual(classify(message, self.settings), Classification.IGNORE)
+
     def test_member_keys_include_every_scope(self):
         key = self.message.member_key
         for field in ("platform_id", "self_id", "group_id", "sender_id"):

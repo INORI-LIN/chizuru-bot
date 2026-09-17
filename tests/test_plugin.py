@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / ".runtime" / "astrbot"
 PLUGIN_PATH = ROOT / "astrbot_plugin_chizuru"
 MODULE_NAME = "data.plugins.astrbot_plugin_chizuru.main"
+PACKAGE_NAME = MODULE_NAME.rpartition(".")[0]
 _ALLOWED_SQLITE_ROOT = (ROOT / ".runtime").resolve()
 _guard_enabled = False
 _violations = []
@@ -49,7 +50,8 @@ sys.addaudithook(_audit)
 def setUpModule():
     global _guard_enabled, resources, plugin_module, core, metadata, handlers
     global AstrBotConfig, AstrMessageEvent, AstrBotMessage, MessageMember, MessageType
-    global PlatformMetadata, At, AtAll, Plain, Reply, Image, call_handler, test_root
+    global PlatformMetadata, At, AtAll, File, Image, Plain, Record, Reply, Video
+    global call_handler, test_root
     resources = ExitStack()
     unittest.addModuleCleanup(resources.close)
     test_root = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="offline-", dir=ROOT / ".runtime")))
@@ -66,7 +68,7 @@ def setUpModule():
     core.astrbot_config["trace_enable"] = False
     from astrbot.api import AstrBotConfig
     from astrbot.api.event import AstrMessageEvent
-    from astrbot.api.message_components import At, AtAll, Image, Plain, Reply
+    from astrbot.api.message_components import At, AtAll, File, Image, Plain, Record, Reply, Video
     from astrbot.core.pipeline.context_utils import call_handler
     from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
     from astrbot.core.platform.message_type import MessageType
@@ -145,8 +147,20 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(metadata.repo)
         self.assertEqual(len(handlers), 1)
         self.assertEqual(handlers[0].extras_configs["priority"], 1000)
-        defaults = AstrBotConfig(str(test_root / "defaults.json"), schema=json.loads((PLUGIN_PATH / "_conf_schema.json").read_text()))
-        self.assertEqual(dict(defaults), {"platform_id": "", "self_id": "", "allowed_group_ids": []})
+        schema = json.loads((PLUGIN_PATH / "_conf_schema.json").read_text())
+        defaults = AstrBotConfig(str(test_root / "defaults.json"), schema=schema)
+        # 从插件包内取 config 子模块：另起一条 import 路径会造出第二个模块实例，
+        # 使 dataclass 相等判断失效。
+        plugin_config = importlib.import_module(f"{PACKAGE_NAME}.config")
+        Settings, default_fields = plugin_config.Settings, plugin_config.default_fields
+        # schema 与 config.py 必须一一对应：多了是无人消费的假配置，少了是隐藏默认。
+        self.assertEqual(set(defaults), set(default_fields()))
+        # schema 默认值必须整体落回"拒绝全部"哨兵，而不是一条看似可用的配置。
+        self.assertEqual(Settings.from_mapping(dict(defaults)), Settings())
+        self.assertIs(defaults["memory_extraction_enabled"], False)
+        self.assertIs(defaults["require_budget_for_extraction"], True)
+        self.assertEqual(defaults["daily_budget_amount"], 0)
+        self.assertEqual(defaults["monthly_budget_amount"], 0)
         plugin = plugin_module.ChizuruPlugin(self.context, defaults)
         self.assertEqual(plugin.classify_event(self.event([At(qq="10001"), Plain("hello")])), "ignore")
         self.assertEqual((SOURCE / "data/plugins/astrbot_plugin_chizuru").resolve(), PLUGIN_PATH)
@@ -163,7 +177,12 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             ([At(qq="10001"), Reply(id="old", chain=[Plain("old")])], "empty_or_unsupported"),
             ([At(qq="10001")], "empty_or_unsupported"),
             ([At(qq="10001"), Plain(" \n")], "empty_or_unsupported"),
-            ([At(qq="10001"), Image(file="unused.png")], "empty_or_unsupported"),
+            # 需求 §4.1：@ 后只有媒体时是独立一档，可回固定能力提示，仍不解析、不调模型。
+            ([At(qq="10001"), Image(file="unused.png")], "unsupported_attachment"),
+            ([At(qq="10001"), Record(file="unused.amr")], "unsupported_attachment"),
+            ([At(qq="10001"), Video(file="unused.mp4")], "unsupported_attachment"),
+            ([At(qq="10001"), File(name="unused.pdf")], "unsupported_attachment"),
+            ([At(qq="10001"), Plain("   "), Image(file="unused.png")], "unsupported_attachment"),
         ]
         for chain, expected in cases:
             with self.subTest(expected=expected, types=[type(part).__name__ for part in chain]):

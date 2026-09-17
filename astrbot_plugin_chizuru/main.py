@@ -1,11 +1,15 @@
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import At, Plain
+from astrbot.api.message_components import At, File, Image, Plain, Record, Video
 from astrbot.api.star import Context, Star
 from astrbot.core.platform.message_type import MessageType
 
 from .config import Settings
 from .policy import Classification, MessageFacts, classify
+
+# 首版不解析媒体（需求 §1.3）：@ 后只有这些组件时，只回固定的文本能力提示。
+# 合并转发（Forward/Nodes）不算附件，它整体不参与采集与解析（需求 §4.2）。
+ATTACHMENT_COMPONENTS = (Image, Record, Video, File)
 
 
 class ChizuruPlugin(Star):
@@ -26,6 +30,7 @@ class ChizuruPlugin(Star):
             is_group=event.get_message_type() == MessageType.GROUP_MESSAGE,
             mention_targets=tuple(str(part.qq) for part in chain if isinstance(part, At)),
             direct_text="".join(part.text for part in chain if isinstance(part, Plain)),
+            has_attachment=any(isinstance(part, ATTACHMENT_COMPONENTS) for part in chain),
         )
         return classify(facts, Settings.from_mapping(self.config))
 
