@@ -1,0 +1,20 @@
+{
+  "platform_id": {
+    "type": "string",
+    "description": "目标 OneBot 平台连接实例 ID",
+    "hint": "空值拒绝全部。本骨架不发送消息，也不放行后续模型调用；仅供专用离线开发实例使用。",
+    "default": ""
+  },
+  "self_id": {
+    "type": "string",
+    "description": "目标机器人 QQ 账号 ID",
+    "hint": "只用于匹配可信事件身份，不填昵称。",
+    "default": ""
+  },
+  "allowed_group_ids": {
+    "type": "list",
+    "description": "允许分类的 QQ 群 ID 列表",
+    "hint": "使用字符串群号；空列表拒绝全部。配置不启用聊天、采集或长期记忆。",
+    "default": []
+  }
+}
