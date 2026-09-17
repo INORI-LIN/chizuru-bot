@@ -49,19 +49,28 @@ class MessageFacts:
         return self.platform_id, self.self_id, self.group_id, self.sender_id
 
 
-def classify(message: MessageFacts, settings: Settings) -> Classification:
-    """判定触发形态。候选不代表获准发送、采集或调用模型。"""
-    if (
-        not settings.identity_configured
-        or not message.is_group
-        or not settings.allows_group(
+def is_trusted_scope(message: MessageFacts, settings: Settings) -> bool:
+    """事件是否落在"可信身份 + 允许范围"内。
+
+    这是触发分类与权限判定共用的唯一谓词：``control.authorize`` 复用同一份，
+    避免两处各写一套判断而漂移。安全判定不应依赖调用方已做过前置校验。
+    """
+    return bool(
+        settings.identity_configured
+        and message.is_group
+        and settings.allows_group(
             message.platform_id,
             message.self_id,
             message.group_id,
         )
-        or not is_qq_id(message.sender_id)
-        or message.sender_id == message.self_id
-    ):
+        and is_qq_id(message.sender_id)
+        and message.sender_id != message.self_id
+    )
+
+
+def classify(message: MessageFacts, settings: Settings) -> Classification:
+    """判定触发形态。候选不代表获准发送、采集或调用模型。"""
+    if not is_trusted_scope(message, settings):
         return Classification.IGNORE
     # 含 @全体 的事件整体忽略，即使同时 @ 了机器人（需求 §4.1）。
     if "all" in message.mention_targets:
