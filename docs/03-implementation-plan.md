@@ -1,6 +1,6 @@
 # 千鹤 QQ 群聊天机器人：实施拆分与任务卡
 
-- 文档版本：0.5
+- 文档版本：0.6
 - 日期：2026-09-17
 - 阶段：实施拆分（规划）。本表所列编码、脚本、配置与联调**均未开始**；本文只是规划产物
 - 需求依据：[需求拆分](./01-requirements.md)
@@ -15,6 +15,7 @@
 | 0.3 | 2026-09-17 | 确认群告知的执行方式为"机器人两步开启"（B1a）；附录 C.1 补充交付机制与文案版本约定；S2-02、S2-05 的任务范围随之细化；目标群与维护者清单仍阻塞 |
 | 0.4 | 2026-09-17 | `群上下文 确认开启` 补入需求文档 §4.4（需求文档升至 0.2）；§3.5 第 3 条由"待决定的扩展"改为"已入库的设计基线" |
 | 0.5 | 2026-09-17 | 架构文档 §4.4 同步群上下文两步确认（架构文档升至 0.3）；§3.5 第 3 条因不再满足"既有文档未指定"而移出本节，改由第 9.1 节 B1a 与附录 C.1 承载实施细节 |
+| 0.6 | 2026-09-17 | 执行 S0 离线核验：新增 `scripts/s0/` 六个核验脚本与汇总入口；修正 K1 行号、S0-02 必关清单（补 5 项）、S0-04 改为两层机制；§8 风险登记全部回写并新增 R15、R16；新增附录 D（出站路径清单、必关配置清单、离线结论与在线待办）。**S0 阶段门仍未通过** |
 
 ## 0. 状态标记与文档约定
 
@@ -176,7 +177,7 @@ scripts/               【新增目录】S0 核验脚本；不属于产品插件
 
 | 编号 | 约束 | 源码位置 | 影响 |
 |---|---|---|---|
-| K1 | 任一插件 handler 的 filter 通过即置 `event.is_wake = True`，事件不再被自动停止 | `astrbot/core/pipeline/waking_check/stage.py:246-248` | 骨架的单一宽 filter 已使所有 aiocqhttp 事件"通过唤醒检查"——G02 未通过的结构性原因 |
+| K1 | 任一插件 handler 的 filter 通过即置 `event.is_wake = True`，事件不再被自动停止 | `astrbot/core/pipeline/waking_check/stage.py:232-233`（另有 `:127-129`、`:146-147`、`:156-157` 三处别的唤醒分支） | 骨架的单一宽 filter 已使所有 aiocqhttp 事件"通过唤醒检查"——G02 未通过的结构性原因。**离线性已证实**：见附录 D.3 |
 | K2 | `WakingCheckStage` 会主动发群消息：filter 抛异常时，以及权限不足且 `no_permission_reply` 开启时 | 同文件 `:202-210`、`:217-222` | 严格 @ 不能只靠插件优先级，必须靠"只启用本插件 + 禁用内置命令 + 关闭该回复"共同保证 |
 | K3 | 私聊默认唤醒（`friend_message_needs_wake_prefix` 默认 `False`） | 同文件 `:151-159` | "私聊不聊天"必须由插件显式 `should_call_llm(False)` + `stop_event()` 兜底 |
 | K4 | `ProcessStage` 在 handler 之后还有第二条默认 LLM 路径 | `astrbot/core/pipeline/process_stage/stage.py:52-67` | 必须验证"一次 @ = 一次模型调用"，否则同一事件可能双次计费 |
@@ -238,9 +239,9 @@ scripts/               【新增目录】S0 核验脚本；不属于产品插件
 | 任务 | 目标 | 依赖 | 交付物 | R | A | 完成判据 |
 |---|---|---|---|---|---|---|
 | S0-01 | 复核环境、锁与无隐式 pip 基线 | — | 验证记录（命令 + 输出） | R-ENV | A18 | `cmp environment/uv.lock .runtime/astrbot/uv.lock` 一致；`git rev-parse HEAD` 为 `ab42c0d9b726d82ad0f9563e04c53a4460c00d61`；`uv lock --check --offline` 通过；16 项离线测试通过；三个 pip 入口（`star_manager.py:139`、`pip_installer.py:1019`、`update_service.py:216`）在本插件启动路径中不被触达 |
-| S0-02 | 证明**全框架严格 @** 可行 | S0-01【授权】 | 必关闭的框架配置清单 + 受控实例证据 | R-TRG | A02、A03、A04 | 逐项核实并记录 `disable_builtin_commands`、`no_permission_reply`、`wake_prefix`、`ignore_at_all`、`ignore_bot_self_message`、`unique_session`（须保持关闭，见 §9.2）；证明非 @ 事件零出站；证明空 @ 不续聊；证明 @ 事件只触发一次模型调用（K4）；证明私聊不回复（K3） |
+| S0-02 | 证明**全框架严格 @** 可行 | S0-01【授权】 | 必关闭的框架配置清单（附录 D.2）+ 门控矩阵证据（附录 D.3） | R-TRG | A02、A03、A04 | 逐项核实并记录**附录 D.2 全表**（含 `empty_mention_waiting`、`provider_settings.enable`、`plugin_set`、`add_cron_tools`；注意 `wake_prefix` 有顶层 list 与 `provider_settings.wake_prefix` string 两个不同键）；用离线门控矩阵证明必关配置下 11 类事件零出站、零模型调用、无可投递结果（`scripts/s0/check_gating.py`）；**在线部分**：真实实例零出站、空 @ 不续聊、@ 只触发一次模型调用（K4）、私聊不回复（K3） |
 | S0-03 | 证明**非唤醒群消息可采集**且不触发模型 | S0-02 | 采集钩子选型结论 | R-CTX、R-TRG | A02、A05 | 普通群消息仅入缓冲，无模型调用、无发送；@ 时不重复建模；明确记录"宽 filter 使事件被视为 wake"（K1）的副作用已被覆盖；确定 §3.5 判断 1 是否成立 |
-| S0-04 | 证明**临时材料不持久化** | S0-01 | 请求体与历史前后对比证据 | R-DATA、R-CTX | A05、A12 | `mark_as_temp()` + `extra_user_content_parts` 不进 system 角色与永久历史；能对"使用长期记忆的整轮"同时抑制 user 与 assistant 落历史（K6）；重启后仍不在 |
+| S0-04 | 证明**临时材料不持久化** | S0-01 | 请求体与历史前后对比证据（附录 D.3） | R-DATA、R-CTX | A05、A12 | **两层机制，单靠 `mark_as_temp()` 不够**：①part 级——注入片段用 `mark_as_temp()`，经 `dump_messages_with_checkpoints` 从持久化内容剔除；②message 级——在 `on_agent_done` 对当前轮 user 与 assistant 两条 `Message` 设 `_no_save = True`，`_save_to_history`（`internal.py:580`）据此整条跳过。离线性已由 `scripts/s0/check_temp.py` 证实；**在线部分**：真实 pipeline 落库前后对比、重启后仍不在 |
 | S0-05 | 核实**原生历史 TTL 与删除接口** | S0-01 | 接口清单 + 最小验证 | R-DATA、R-CTX | A06、A09、A19 | 可按 umo 删除群会话（K9）；可按 message id 删除；确认 TTL 是否原生存在（无则由插件清理）；明确记录群共享会话下"清空整段历史"会影响全群这一副作用 |
 | S0-06 | **出站路径全覆盖审计** | S0-02 | 出站路径清单 + 控制措施 | R-TRG、R-DATA | A02、A19 | 枚举 RespondStage 之外的全部出站（`event.send`、流式发送、第三方插件、框架错误与权限提示）；确认 `on_decorating_result` / `after_message_sent` 语义；确认 after_message_sent 不等于已读回执（架构 §8.2） |
 | S0-07 | 核实**真实 DeepSeek 提供商能力**【阻塞·凭据】【授权】【在线】 | S0-01 | 证据 + 推荐模型 ID 与参数 | R-CHAT、R-OPS | A01、A16、A17 | 聊天可用；不输出 reasoning_content；`usage` 可读（K10）；401/402/429/5xx/超时可分类；合并 SDK 重试后总次数可计算；上下文容量可核实 |
@@ -420,22 +421,26 @@ S0-01 → S0-02 → S0-03 → S1-01 → S1-02 → S1-03 → S1-14 → S1-15 → 
 
 本表合并架构文档 §12 的未核验项与本次源码复核的新增发现。**"当前状态"列在 S0 执行过程中回写**，本行为 S0 的证据落点。
 
+状态口径：`离线已证实` ＝ `scripts/s0/` 的核验通过；`在线待验证` ＝ 必须真实实例；两者不可互相替代。
+
 | 编号 | 未核验项 | 失败后果 | 承接任务 | 当前状态 |
 |---|---|---|---|---|
-| R1 | `mark_as_temp()` 的最低版本说明不代表其他使用的钩子在同版本均符合需求（架构 §12） | G03 失败：动态材料进入永久历史，"临时"声明不成立 | S0-04 | 未验证 |
-| R2 | 发送前钩子可能不覆盖 `event.send` 或第三方插件主动发送（架构 §12） | G02/G07 失败：存在绕过门控的出站 | S0-06、S1-12 | 未验证 |
-| R3 | 一次"测试模型"成功不等于历史、超时、重试与费用统计正确（架构 §12） | G06 失败：预算与降级不可靠 | S0-07、S4-02 | 未验证 |
-| R4 | 一次 `uv sync --locked` 成功不等于插件启动过程无隐式 pip（架构 §12） | R-ENV 失败：违反"全程 uv" | S0-01、S4-07 | 未验证 |
-| R5 | NapCat 文档列出 Mac 支持不等于当前 QQ 客户端与本机 CPU 已通过验证（架构 §12） | G01 失败：无法联调 | S0-09、S4-06 | 未验证 |
-| R6 | `WakingCheckStage` 早于插件执行且可主动发送错误/权限提示，G02 未通过（架构 §14.4；本文 K1、K2） | 严格 @ 不可保证，可能对非 @ 事件出站 | S0-02、S0-03、S1-16 | 已确认未通过 |
-| R7 | `astrbot.core` 导入会创建框架配置与数据库对象；`shared_preferences` 在导入链内启动调度器（架构 §14.4.2/14.4.3） | 测试出现未预期副作用，"无副作用"结论失真 | S0-01、S1-15 | 部分已知 |
-| R8 | 离线测试守卫无条件禁止 `sqlite3.connect`（本文 K12） | 存储类任务无法测试，或被迫删除整体守卫导致保护退化 | S2-01、S3-01 | 已确认 |
-| R9 | 直接导入完整 `StarRequestSubStage` 触发循环导入，网络守卫被触发（架构 §14.4.5） | 处理链测试不可用，只能收缩到 `call_handler` | S0-06、S1-15 | 已确认 |
-| R10 | `message_id` 稳定性与重连回放窗口未知（架构 §6.1） | 去重失效，重复聊天或重复写入 | S0-08、S1-08 | 未验证 |
-| R11 | 原生流程可能在发送门控前就写入历史（架构 §6.2） | G03/G04 失败：删除竞态无法阻止落历史 | S0-04、S0-05、S3-09 | 未验证 |
-| R12 | 插件依赖安装后端可能走 pip（架构 §10.3；`star_manager.py:139` 等） | R-ENV 失败 | S0-01、S1-01 | 已审计入口，未运行 |
-| R13 | 私聊默认唤醒（K3）与 ProcessStage 第二条 LLM 路径（K4） | A02/A03 失败：私聊被回复；@ 事件双次调用模型 | S0-02、S1-03、S1-14 | 已确认行为 |
-| R14 | 群共享会话下"清空整段群历史"会清掉全群互动历史（K9） | A06/A12 语义偏差，需向成员明确告知 | S0-05、S2-07、S2-08 | 已确认行为 |
+| R1 | `mark_as_temp()` 的最低版本说明不代表其他使用的钩子在同版本均符合需求（架构 §12） | G03 失败：动态材料进入永久历史，"临时"声明不成立 | S0-04 | **离线已证实**：`mark_as_temp()` 只作用于 part，整轮排除须叠加 `Message._no_save`；在线待验证 |
+| R2 | 发送前钩子可能不覆盖 `event.send` 或第三方插件主动发送（架构 §12） | G02/G07 失败：存在绕过门控的出站 | S0-06、S1-12 | **离线已证实**：框架无全局出站门控，`context.send_message()` 无钩子；控制手段只有"只启用已审计插件"。在线待验证 |
+| R3 | 一次"测试模型"成功不等于历史、超时、重试与费用统计正确（架构 §12） | G06 失败：预算与降级不可靠 | S0-07、S4-02 | 在线待验证（阻塞于凭据） |
+| R4 | 一次 `uv sync --locked` 成功不等于插件启动过程无隐式 pip（架构 §12） | R-ENV 失败：违反"全程 uv" | S0-01、S4-07 | **离线部分已证实**：锁一致、无 requirements、插件源码不导入 pip；插件启动路径待在线验证 |
+| R5 | NapCat 文档列出 Mac 支持不等于当前 QQ 客户端与本机 CPU 已通过验证（架构 §12） | G01 失败：无法联调 | S0-09、S4-06 | 在线待验证（阻塞于账号） |
+| R6 | `WakingCheckStage` 早于插件执行且可主动发送错误/权限提示，G02 未通过（架构 §14.4；本文 K1、K2） | 严格 @ 不可保证，可能对非 @ 事件出站 | S0-02、S0-03、S1-16 | **离线已证实**：默认配置下「空 @」会经保留内置插件泄漏一次模型调用；必关配置下 11 类事件全部干净。在线待验证 |
+| R7 | `astrbot.core` 导入会创建框架配置与数据库对象；`shared_preferences` 在导入链内启动调度器（架构 §14.4.2/14.4.3） | 测试出现未预期副作用，"无副作用"结论失真 | S0-01、S1-15 | **离线已证实并新增一条**：`WakingCheckStage.process` 每条事件都会经 `SessionPluginManager.filter_handlers_by_session` 读写数据库，离线核验必须放行隔离临时库 |
+| R8 | 离线测试守卫无条件禁止 `sqlite3.connect`（本文 K12） | 存储类任务无法测试，或被迫删除整体守卫导致保护退化 | S2-01、S3-01 | **已解决**：守卫改为只放行 `.runtime/` 下的路径，其余仍硬拒绝，并有回归用例钉住 |
+| R9 | 直接导入完整 `StarRequestSubStage` 触发循环导入，网络守卫被触发（架构 §14.4.5） | 处理链测试不可用，只能收缩到 `call_handler` | S0-06、S1-15 | **已确认并绕过**：离线核验统一走 `call_handler` 复刻 `star_request.py` 的调用循环；`internal.py` 仍未导入，`_save_to_history` 的条件由 `check_outbound.py` 钉住源码 |
+| R10 | `message_id` 稳定性与重连回放窗口未知（架构 §6.1） | 去重失效，重复聊天或重复写入 | S0-08、S1-08 | 在线待验证 |
+| R11 | 原生流程可能在发送门控前就写入历史（架构 §6.2） | G03/G04 失败：删除竞态无法阻止落历史 | S0-04、S0-05、S3-09 | **离线已证实**：`STAGES_ORDER` 中 ProcessStage 早于 RespondStage，历史在发送前落库 |
+| R12 | 插件依赖安装后端可能走 pip（架构 §10.3；`star_manager.py:139` 等） | R-ENV 失败 | S0-01、S1-01 | **离线已证实入口仍在**；实际不被触发须在线验证 |
+| R13 | 私聊默认唤醒（K3）与 ProcessStage 第二条 LLM 路径（K4） | A02/A03 失败：私聊被回复；@ 事件双次调用模型 | S0-02、S1-03、S1-14 | **离线已证实行为**：私聊默认 `at_or_wake=True`；第二条路径门槛是 `is_at_or_wake_command`。在线待验证 |
+| R14 | 群共享会话下"清空整段群历史"会清掉全群互动历史（K9） | A06/A12 语义偏差，需向成员明确告知 | S0-05、S2-07、S2-08 | **离线已证实**：`unique_session=false` 时 umo 只含群号，按 umo 删除即整群；原生无成员级删除 |
+| R15 | 保留内置插件 `astrbot.builtin_stars.astrbot.main` **不受 `disable_builtin_commands` 约束**，其 `handle_empty_mention` 优先级高于本插件且会 `stop_event()`，使本插件根本不被执行 | A03 失败：空 @ 会被回复并向模型发起请求 | S0-02、S1-16 | **离线已证实**：唯一关闭手段是 `platform_settings.empty_mention_waiting`（含 `_need_reply`）。在线待验证 |
+| R16 | 框架对会话与平台消息历史**没有原生 TTL**；`agent_runner…compression.max_turns` 默认 `-1`（不限） | R-CTX 的 20 轮/24 小时与 R-MEM 的 90 天全部需要插件自建清理 | S2-07、S2-08、S3-02 | **离线已证实** |
 
 ## 9. 阻塞清单与确认状态
 
@@ -460,7 +465,7 @@ S0-01 → S0-02 → S0-03 → S1-01 → S1-02 → S1-03 → S1-14 → S1-15 → 
 
 **凭据的处理方式**：DeepSeek API Key 与 OneBot Token 按架构 §11.2 走运行时受限配置，**不进入本文档、仓库、模型上下文与普通日志**。提供时只需说明配置位置与安排，不需要把值写入任何被版本管理的文件。
 
-**可先行的工作**：S0-01、S0-02（离线配置清单部分）、S0-03、S0-04、S0-05、S0-06、S0-08 以及 S1 的绝大部分离线任务不依赖上述三项，可先推进。
+**可先行的工作**：S0-01、S0-02（离线配置清单部分）、S0-03、S0-04、S0-05、S0-06、S0-08 以及 S1 的绝大部分离线任务不依赖上述三项，可先推进。**S0 的离线部分已于 2026-09-17 执行完毕（见附录 D）；其中 S0-02/03/04/05 的在线部分、S0-07、S0-09 仍待上述前置。**
 
 ### 9.3 设计要求（非待确认项）
 
@@ -716,3 +721,91 @@ DeepSeek 处理，而且已经发出的群消息其他成员都能看到，无�
 · 不对作品的未公开内容或后续发展作预测性断言。
 · 若群维护者另行指定可讨论范围，以该范围为准。
 ```
+
+## 附录 D：S0 核验记录
+
+**本附录是 S0 离线核验的证据落点。全部结论仅覆盖离线部分；S0 阶段门未通过，不得据此进入 S1。**
+
+- 核验日期：2026-09-17
+- 环境：AstrBot `v4.28.1` / 提交 `ab42c0d9b726`；CPython 3.12.9；macOS arm64
+- 复现：`bash scripts/s0/run_all.sh`（63 项核验 + 17 项既有回归，全部通过，可重复）
+- 脚本不属于产品插件包，不参与插件运行时
+
+### D.1 出站路径清单（S0-06）
+
+上游共 **123 处**出站调用点，分布在 **53 个文件**（指纹见 `check_outbound.py`，指纹变化即强制重新审计）。
+
+按"能否用配置关闭"分类：
+
+| 类别 | 代表路径 | 能否配置关闭 |
+|---|---|---|
+| RespondStage 正常/流式发送 | `pipeline/respond/stage.py:310,320`；`:230` | 间接：靠处理器不产生 result，以及 `provider_settings.streaming_response=false` |
+| WakingCheckStage 直接发送 | `pipeline/waking_check/stage.py:202-208`（filter 抛异常）、`:217-222`（权限不足） | **不能**（无配置键）。只能靠收窄 `plugin_set` 与保证自身 filter 不抛异常 |
+| 框架默认 LLM 路径 | `process_stage/method/agent_sub_stages/internal.py:153-156,540-548` | 能：`provider_settings.enable=false` |
+| 工具直发 | `astr_agent_tool_exec.py:707-717` 等 | 能：不发生产具调用即不触达 |
+| 内置指令 | `builtin_stars/builtin_commands/` | 能：`disable_builtin_commands=true` |
+| 保留内置插件的空 @ 回复 | `builtin_stars/astrbot/main.py:99-109,112` | 能：`platform_settings.empty_mention_waiting=false`（**`disable_builtin_commands` 覆盖不到**） |
+| 主动回复 / 群上下文注入 | `builtin_stars/astrbot/main.py:229-270` | 能：默认已关闭，保持关闭 |
+| 会话直发 API | `star/context.py:614-648` → `send_by_session` | **不能**。无钩子可拦，只能靠"只启用已审计插件" |
+| cron 定时任务 | `cron/events.py:49-64` | 能：`proactive_capability.add_cron_tools=false`，且确认无已存在任务 |
+| 平台适配器兜底 | `aiocqhttp_platform_adapter.py:236`、`aiocqhttp_message_event.py:119-120` | **不能**（异常路径） |
+
+**框架级结论**：不存在全局出站门控。`on_decorating_result` 与 `after_message_sent` **不是拦截点**（后者语义是"已尝试发送"，不是已读回执）。唯一可靠的约束是"只加载已审计的插件 + 关掉上表能关的路径"。
+
+### D.2 必关配置清单（S0-02）
+
+必须设在**全局配置**（`<ASTRBOT_ROOT>/data/cmd_config.json`，或 WebUI 对应项）；插件的 `_conf_schema.json` **无法**设置这些键。
+
+| 键 | 默认值 | 设为 | 关闭什么 |
+|---|---|---|---|
+| `disable_builtin_commands` | `False` | `true` | 内置指令模块的全部指令 |
+| `plugin_set` | `["*"]` | `["astrbot_plugin_chizuru"]` | 其他第三方插件；保留内置插件不受此键约束 |
+| `platform_settings.no_permission_reply` | `True` | `false` | 权限不足时的群内回复 |
+| `platform_settings.empty_mention_waiting` | `True` | `false` | **空 @ 进入等待续聊**（唯一的关闭手段） |
+| `platform_settings.empty_mention_waiting_need_reply` | `True` | `false` | 空 @ 的兜底回复（双保险） |
+| `platform_settings.friend_message_needs_wake_prefix` | `False` | `true` | 私聊默认唤醒（插件侧仍须显式收口，K3） |
+| `platform_settings.ignore_at_all` | `False` | `true` | @全体 唤醒 |
+| `platform_settings.ignore_bot_self_message` | `False` | `true` | 机器人自身消息 |
+| `platform_settings.unique_session` | `False` | **保持 `false`** | 开启会按成员隔离会话，与 R-CTX"同群共享上下文"冲突 |
+| `provider_settings.enable` | `True` | `false` | 框架默认 LLM 路径（含 K4 第二条路径）。本插件经 `get_using_provider_async` 直接取提供商，不受影响 |
+| `provider_settings.streaming_response` | `False` | `false` | 流式发送路径 |
+| `provider_settings.wake_prefix` | `""` | `""` | 额外的 LLM 唤醒前缀 |
+| `provider_settings.proactive_capability.add_cron_tools` | `True` | `false` | cron 工具暴露；另需确认无已存在任务 |
+| `provider_ltm_settings.group_icl_enable` | `False` | `false` | 原生群上下文注入（避免双份存储） |
+| `provider_ltm_settings.group_message_history_enable` | `False` | `false` | 原生群历史持久化 |
+| `provider_ltm_settings.active_reply.enable` | `False` | `false` | 主动回复 |
+
+**易混点**：`wake_prefix` 有**两个不同键**——顶层 `wake_prefix`（list，默认 `["/"]`，机器人唤醒前缀）与 `provider_settings.wake_prefix`（string，默认 `""`）。S0-02 要处理的是前者。
+
+**保留内置插件无法用 `plugin_set` 排除**：`astrbot.builtin_stars.astrbot.main` 与 `builtin_commands` 属于保留插件，恒定加载。因此 `handle_empty_mention` 这类处理器永远存在，只能靠配置关掉其行为。
+
+### D.3 离线核验结论与在线待办
+
+**离线已证实**
+
+| 项 | 结论 | 证据 |
+|---|---|---|
+| S0-01 | 锁一致、上游提交未漂移、`uv lock --check` 通过、插件无 requirements 且不导入 pip | `check_env.py` 10/10 |
+| S0-02「空 @」 | **默认配置下确会泄漏**：保留内置插件在优先级高于本插件的位置发起一次模型调用并 `stop_event()`，本插件根本不被执行 | `check_gating.py` 默认档观测 |
+| S0-02 必关配置 | 11 类事件（非 @、@ 机器人、空 @、@全体、@全体+@、引用内 @、私聊、自身消息、未允许群、@ 后仅图片、非 @ 但以唤醒前缀开头）全部零出站、零模型调用、无可投递结果 | `check_gating.py` 12/12 |
+| S0-03 | 普通群消息可被宽 filter 观测（采集可行），且 `is_at_or_wake_command=False`，不会取得模型调用资格 | `check_collect.py` 7/7 |
+| S0-04 | `mark_as_temp()` 只作用于 part；整轮排除须叠加 `Message._no_save`；该标记是 PrivateAttr，不参与序列化 | `check_temp.py` 8/8 |
+| S0-05 | 无原生 TTL；umo 只含群号，删除即整群；原生无成员级删除；`max_turns` 默认 `-1` | `check_history.py` 11/11 |
+| S0-06 | 出站面 123 处/53 文件已指纹固化；11 条关键上游行为假设仍成立 | `check_outbound.py` 15/15 |
+| K12 | 测试守卫改为作用域化（只放行 `.runtime/`），有回归用例钉住 | `tests/test_plugin.py` 新增用例，全套 17 项通过 |
+
+**在线待办（阻塞于账号与凭据，条件具备时按此清单执行）**
+
+| 编号 | 待验证 | 方法 | 通过标准 |
+|---|---|---|---|
+| O-01 | 真实实例零出站 | 加载本插件 + 附录 D.2 配置，向测试群发送非 @ 消息、@他人、私聊 | 群内与私聊均无任何回复；NapCat 侧无出站记录 |
+| O-02 | 空 @ 不续聊 | 发送仅含 @机器人 的消息，随后跟一条普通文本 | 不回复；不出现"想要问些什么"；后续那条普通文本不被回复 |
+| O-03 | 一次 @ 只调用一次模型 | 配好 DeepSeek 后 @ 一次，核对提供商侧请求数 | 恰好 1 次请求，无第二条默认 LLM 路径 |
+| O-04 | 私聊不回复 | 私聊发送任意文本 | 无回复 |
+| O-05 | 真实落库前后对比 | 按 S0-04 两层机制注入临时材料，读 SQLite 的 `conversations.content` | 注入片段与整轮均不入库；重启后仍不在 |
+| O-06 | 真实删除 | 建会话后按 umo 删除，重启复查 | 行已删除且不复活；影响范围为整群（需向成员告知） |
+| O-07 | `message_id` 稳定性 | 触发断线重连，观察回放 | 记录是否重复投递及时间窗，据此定去重窗口 |
+| O-08 | 保留内置插件能否在 WebUI 关闭 | 在插件页尝试停用保留插件 | 若不支持，则完全依赖 D.2 的配置键 |
+| O-09 | 无隐式 pip | 完整启动实例，观察安装与启动日志 | 无 pip/pip3/python -m pip 调用 |
+| O-10 | NapCat/QQ/Mac 组合 | 建立鉴权 OneBot 连接 | 连接可用；断线与离线可观察 |
+

@@ -1,6 +1,7 @@
 /.runtime/
 /.tools/
 /.cache/
+/data/
 .venv/
 __pycache__/
 *.py[cod]

@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / ".runtime" / "astrbot"
 PLUGIN_PATH = ROOT / "astrbot_plugin_chizuru"
 MODULE_NAME = "data.plugins.astrbot_plugin_chizuru.main"
+_ALLOWED_SQLITE_ROOT = (ROOT / ".runtime").resolve()
 _guard_enabled = False
 _violations = []
 
@@ -20,10 +21,20 @@ _violations = []
 def _audit(event, args):
     if not _guard_enabled:
         return
+    if event == "sqlite3.connect":
+        # K12：只放行 .runtime 下的临时库，其他路径仍硬拒绝——守卫是收窄而非移除。
+        try:
+            target = Path(str(args[0])).resolve() if args else None
+            allowed = target is not None and target.is_relative_to(_ALLOWED_SQLITE_ROOT)
+        except (OSError, ValueError):
+            allowed = False
+        if not allowed:
+            _violations.append(event)
+            raise AssertionError(f"Offline test forbids {event} outside {_ALLOWED_SQLITE_ROOT}")
+        return
     blocked = event in {
         "subprocess.Popen", "os.system", "os.posix_spawn", "os.exec", "os.fork",
         "socket.connect", "socket.bind", "socket.getaddrinfo", "socket.sendto",
-        "sqlite3.connect",
     }
     if event == "import" and args[0].split(".")[0] == "pip":
         blocked = True
@@ -227,6 +238,27 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.get_extra("chizuru.classification"), "ignore")
         self.assertTrue(event.is_stopped())
         event.send.assert_not_called()
+
+    def test_sqlite_guard_is_scoped_not_removed(self):
+        """K12：守卫只放行 .runtime 下的临时库，其他路径仍然硬拒绝。"""
+        import shutil
+        import sqlite3
+
+        outside = Path(tempfile.gettempdir()) / "chizuru-guard-probe.db"
+        before = len(_violations)
+        with self.assertRaises(AssertionError):
+            sqlite3.connect(str(outside))
+        # 这次拒绝是本用例故意触发的；从模块级汇总里移除，避免污染 _finish_guard。
+        del _violations[before:]
+        self.assertFalse(outside.exists())
+
+        # 放在 test_root 之外：test_root 另有"不得出现任何 .db"的不变量。
+        scratch = Path(tempfile.mkdtemp(prefix="guard-", dir=ROOT / ".runtime"))
+        self.addCleanup(shutil.rmtree, scratch, ignore_errors=True)
+        inside = scratch / "guard-probe.db"
+        connection = sqlite3.connect(str(inside))
+        connection.close()
+        self.assertTrue(inside.exists())
 
 
 if __name__ == "__main__":
