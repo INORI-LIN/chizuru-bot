@@ -228,5 +228,46 @@ class ValidationTests(PolicyStoreTestCase):
                     )
 
 
+class BumpRevisionTests(PolicyStoreTestCase):
+    """S2-05：`上下文 清空` 与"无策略行的暂停"共用的只增修订号入口。"""
+
+    def test_bump_without_row_creates_a_closed_row(self):
+        group = self.group()
+        self.clock.advance(30)
+        self.assertEqual(self.storage.groups.bump_revision(group), 1)
+        policy = self.storage.groups.policy(group)
+        self.assertTrue(policy.exists)
+        self.assertEqual(policy.revision, 1)
+        self.assertEqual(policy.notice_version, "")
+        self.assertFalse(policy.context_enabled)
+        self.assertFalse(policy.paused)
+        # 建行不等于"已告知"：采集判定仍然关闭。
+        self.assertFalse(policy.is_collection_open(required_notice_version=NOTICE))
+
+    def test_bump_increments_without_touching_other_fields(self):
+        group = self.group()
+        self.storage.groups.record_notice_confirmed(group, version=NOTICE, actor_id="30001")
+        self.storage.groups.set_paused(group, paused=True)
+        before = self.storage.groups.policy(group)
+        self.assertEqual(self.storage.groups.bump_revision(group), before.revision + 1)
+        after = self.storage.groups.policy(group)
+        self.assertEqual(after.context_enabled, before.context_enabled)
+        self.assertEqual(after.paused, before.paused)
+        self.assertEqual(after.notice_version, before.notice_version)
+
+    def test_bump_is_not_idempotent_and_is_monotonic(self):
+        group = self.group()
+        values = [self.storage.groups.bump_revision(group) for _ in range(3)]
+        self.assertEqual(values, [1, 2, 3])
+
+    def test_bump_is_isolated_by_key(self):
+        first, second = self.group(), self.group(group_id="20002")
+        self.storage.groups.bump_revision(first)
+        self.storage.groups.bump_revision(first)
+        self.storage.groups.bump_revision(second)
+        self.assertEqual(self.storage.groups.policy(first).revision, 2)
+        self.assertEqual(self.storage.groups.policy(second).revision, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

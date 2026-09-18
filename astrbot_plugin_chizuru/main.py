@@ -26,22 +26,28 @@
 
 **临时边界与已知限制**（均记入 docs/03 §5.2，落地后回改）：
 
-- 群开关（`send_gate` 的 `GroupState`）仍由部署配置推导：持久化群策略已在 S2-01 落地，
-  但**替换延后到 S2-02**——S2-02 之前没有任何合法途径写出"已告知 + 开启"，提前替换只会
-  让聊天静默停摆。聊天不要求告知，采集才要求。
+- 群开关（`send_gate` 的 `GroupState`）**来自持久化策略**（S1 的"仅看部署配置"已在 S2-02
+  替换）：CHAT 受"暂停"约束，`FIXED_NOTICE` 不受（否则暂停群里连状态查询都不可达）；
+  存储缺失或读失败按未暂停处理（R21：存储不是聊天的前置条件）。暂停期聊天在调模型前
+  就停下，不产生费用。聊天不要求告知，采集才要求。
 - 普通群聊采集（S2-03）与 `上下文 退出/加入`（S2-04）已接线；采集准入读持久化群策略
-  （**无行即关闭**），因此 S2-02/S2-05 落地前生产环境实际不采集、暂停/关闭命令也不存在。
+  （**无行即关闭**）。
 - 动态材料与互动历史（S2-06/S2-07）已接入请求：材料只落 `extra_user_content_parts` 并
   标记为临时，历史只落 `contexts`；两者都经同一 token 预算裁剪，**结构上不进 system**。
   超预算时不调模型、不发送、静默（超长提示文案属附录 C 待审范围）。
 - 互动历史写回只在**送达成功**后进行，且写前重读群/成员修订号；写失败只记审计，
   不影响已送达的回复、不置持久降级（历史不是聊天的前置条件）。
+- 群维护者命令（S2-02/S2-05）已接线：`群上下文 开启` 逐字回复附录 C.1 全文并记录
+  5 分钟待确认窗口，`群上下文 确认开启` 在窗口内同群同人时写入告知版本并开启采集
+  （失败重发全文并重开窗口）；`群上下文 关闭` / `上下文 清空` / `千鹤 暂停/恢复`
+  执行状态变更。
+- 群内出口有且只有两处：`千鹤 状态`（既有报告 + 一行群上下文状态）与 `群上下文 开启`
+  （含确认失败时的重发全文）。`上下文 退出/加入` 与 S2-05 的其余状态变更执行但**静默
+  无回执**；其余控制指令（记忆类与 `帮助`）不执行：回执文案属附录 C 待审范围，
+  执行属 S3-03/S3-04，此刻发明文案会先于评审。
 - 存储路径来自 AstrBot 插件数据目录，**延迟建库**（不写不建文件）；解析或打开失败即
   降级为"无存储"，采集与退出/加入保持关闭，`千鹤 状态` 可见。
 - 去重窗口与容量是装配层常量，标注"建议参数待评审"——取值依赖仍未在线核验的 O-07。
-- 群内出口只有 `千鹤 状态`（用 `health.format_report` 的既有文本）；`上下文 退出/加入`
-  执行但**静默无回执**，其余控制指令不执行：回执文案属附录 C 待审范围，执行属
-  S2-05/S3-04，此刻发明文案会先于评审。
 - 聊天失败不发任何群内提示：同样的理由（架构 §8.3 的失败文案属 S4-01）。
 - `limits` 与 `budget` 在 `initialize()` 时固定，运行时改动需重载插件；身份、允许群、
   维护者映射与金额开关每个事件重读（配置变更即时生效）。
@@ -77,7 +83,7 @@ from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.agent.message import TextPart
 from astrbot.core.platform.message_type import MessageType
 
-from . import commands, context_assembly, health, history, llm, redact, storage
+from . import commands, context_assembly, health, history, llm, notice, redact, storage
 from .budget import BudgetLedger, BudgetRefusal, BudgetRefused, PriceTable, Reservation, UsageKind
 from .config import Settings
 from .context_buffer import BufferShape, ContextBuffer, IngestOutcome
@@ -123,6 +129,7 @@ class _Services:
     redactor: redact.Redactor
     storage: storage.Storage | None
     context_buffer: ContextBuffer
+    notice: notice.NoticeGate
 
 
 @dataclass(frozen=True)
@@ -208,6 +215,7 @@ class ChizuruPlugin(Star):
                 ttl_seconds=settings.context.buffer_ttl_seconds,
                 clock=self.clock,
             ),
+            notice=notice.NoticeGate(clock=self.clock),
         )
 
     async def terminate(self) -> None:
@@ -314,8 +322,20 @@ class ChizuruPlugin(Star):
             commands.CommandKind.CONTEXT_JOIN,
         ):
             await self._handle_context_switch(event, facts, settings, services, intent)
+        elif intent.kind in (
+            commands.CommandKind.GROUP_NOTICE_OPEN,
+            commands.CommandKind.GROUP_NOTICE_CONFIRM,
+        ):
+            await self._handle_group_notice(event, facts, settings, services, intent)
+        elif intent.kind in (
+            commands.CommandKind.GROUP_CONTEXT_CLOSE,
+            commands.CommandKind.CONTEXT_CLEAR,
+            commands.CommandKind.PAUSE,
+            commands.CommandKind.RESUME,
+        ):
+            await self._handle_group_control(event, facts, settings, services, intent)
         else:
-            # 其它控制指令的执行与文案分别属 S2-05/S3-04 与附录 C 待审范围。
+            # 其余控制指令（记忆类与 帮助）的执行与文案属 S3-03/S3-04 与附录 C.2/C.3 待审范围。
             self._audit(services, redact.EventCategory.IGNORED)
 
     # ---- 普通群聊采集（S2-03） ----
@@ -414,6 +434,12 @@ class ChizuruPlugin(Star):
         key = DedupKey(group=group, message_id=message_id, action=ActionKind.CHAT_REPLY)
         if services.dedup.begin(key) is not Claim.FIRST:
             self._audit(services, redact.EventCategory.IGNORED)
+            return
+
+        if self._group_state(settings, facts, services, kind=SendKind.CHAT) is not GroupState.OPEN:
+            # 本群已暂停（S2-05）：在装配、取提供商与预留之前就停下，不白花一次模型调用。
+            services.dedup.release(key)
+            self._audit(services, redact.EventCategory.GATE_DROP)
             return
 
         prepared = await self._prepare_chat(event, facts, settings, services, message_id)
@@ -724,9 +750,9 @@ class ChizuruPlugin(Star):
             budget=services.budget.snapshot(),
             scheduler=services.scheduler.stats(),
         )
-        report = "\n".join(
-            health.format_report(snapshot, configured=settings.identity_configured)
-        )
+        lines = list(health.format_report(snapshot, configured=settings.identity_configured))
+        lines.append(self._describe_group(services, facts))
+        report = "\n".join(lines)
         outcome, _ = await self._deliver(
             event,
             facts,
@@ -738,6 +764,24 @@ class ChizuruPlugin(Star):
             llm_invoked=False,
         )
         services.dedup.finish(key, outcome)
+
+    def _describe_group(self, services: _Services, facts: MessageFacts) -> str:
+        """群上下文状态行（**维护者可见新文案，待评审**）：只读，绝不建行。
+
+        无存储或读失败时按"未告知"显示——降级原因由 `health` 的既有行解释。
+        """
+        stored = services.storage
+        if stored is None or stored.database.failed:
+            return notice.describe_policy(notice_version="", context_enabled=False, paused=False)
+        try:
+            policy = stored.groups.policy(self._group_key(facts))
+        except storage.StorageFailure:
+            return notice.describe_policy(notice_version="", context_enabled=False, paused=False)
+        return notice.describe_policy(
+            notice_version=policy.notice_version,
+            context_enabled=policy.context_enabled,
+            paused=policy.paused,
+        )
 
     def _observe_platform(self, services: _Services, settings: Settings) -> None:
         """按 `health` 的提取契约读平台状态：只读 `status` 与错误条数。"""
@@ -832,6 +876,244 @@ class ChizuruPlugin(Star):
         self._audit(services, redact.EventCategory.CONTEXT_OP)
         services.dedup.finish(key, Outcome.COMPLETED)
 
+    # ---- 控制：群告知两步开启（S2-02） ----
+
+    async def _handle_group_notice(
+        self,
+        event: AstrMessageEvent,
+        facts: MessageFacts,
+        settings: Settings,
+        services: _Services,
+        intent: commands.CommandIntent,
+    ) -> None:
+        """`群上下文 开启` / `群上下文 确认开启`：两步告知（B1a），文案逐字取自附录 C.1。
+
+        第一步只回复全文并记录待确认窗口（写入面不发生）；第二步在窗口内同群同人才写入
+        告知版本并开启采集。窗口不满足时**重发全文并重开窗口**——B1a 的"要求重新发起"
+        因此不需要任何新文案。
+        """
+        group = self._group_key(facts)
+        message_id = self._message_id(event)
+        if message_id is None:
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+        key = DedupKey(group=group, message_id=message_id, action=ActionKind.CHAT_REPLY)
+        if services.dedup.begin(key) is not Claim.FIRST:
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+        if not authorize(intent, facts, settings).allowed:
+            services.dedup.release(key)
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+
+        if not self._notice_version_ready(settings, services):
+            # 部署声明的文案版本与插件内文本不一致：不展示、不写入、不回（回执文案待审），
+            # 只留审计——否则会出现"写了版本 A 却按版本 B 判定"的永不开启。
+            services.dedup.finish(key, Outcome.COMPLETED)
+            return
+
+        if intent.kind is commands.CommandKind.GROUP_NOTICE_OPEN:
+            outcome = await self._deliver_notice(
+                event, facts, settings, services, group, actor_id=facts.sender_id
+            )
+            services.dedup.finish(key, outcome)
+            return
+
+        confirmed = services.notice.confirm(
+            group,
+            actor_id=facts.sender_id,
+            version=settings.notice_version,
+        )
+        if confirmed is notice.ConfirmOutcome.CONFIRMED:
+            outcome = self._record_notice(group, facts, settings, services, message_id)
+            services.dedup.finish(key, outcome)
+            return
+
+        # 过期 / 换人 / 无待确认 / 版本不符：一律重发全文并重开窗口（语义完全相同）。
+        outcome = await self._deliver_notice(
+            event, facts, settings, services, group, actor_id=facts.sender_id
+        )
+        services.dedup.finish(key, outcome)
+
+    def _notice_version_ready(self, settings: Settings, services: _Services) -> bool:
+        """部署配置的告知版本必须与插件内文案版本一致，否则拒绝（fail-closed）。
+
+        不一致时宁可什么都不做：写入 A 却按 B 判定会让采集永远打不开，而群内文案
+        （告知全文）此时与实际采集行为不符，不能靠猜。
+        """
+        if settings.notice_version == notice.NOTICE_VERSION:
+            return True
+        self._audit(
+            services,
+            redact.EventCategory.CONTEXT_OP,
+            code=redact.ErrorCode.REQUEST_INVALID,
+        )
+        return False
+
+    def _record_notice(
+        self,
+        group: GroupKey,
+        facts: MessageFacts,
+        settings: Settings,
+        services: _Services,
+        message_id: str,
+    ) -> Outcome:
+        """写入告知版本、时间与告知人（幂等）；无存储或写失败都按"未发生"处理。"""
+        stored = services.storage
+        if stored is None or stored.database.failed:
+            self._storage_failed(services, facts, message_id, category=redact.EventCategory.CONTEXT_OP)
+            return Outcome.COMPLETED
+        try:
+            stored.groups.record_notice_confirmed(
+                group,
+                version=settings.notice_version,
+                actor_id=facts.sender_id,
+            )
+        except storage.StorageFailure:
+            self._storage_failed(services, facts, message_id, category=redact.EventCategory.CONTEXT_OP)
+            return Outcome.COMPLETED
+        self._audit(services, redact.EventCategory.CONTEXT_OP)
+        return Outcome.COMPLETED
+
+    async def _deliver_notice(
+        self,
+        event: AstrMessageEvent,
+        facts: MessageFacts,
+        settings: Settings,
+        services: _Services,
+        group: GroupKey,
+        *,
+        actor_id: str,
+    ) -> Outcome:
+        """回复告知全文；**只有送达成功才记录待确认窗口**（B1a 步骤 1）。"""
+        outcome, sent = await self._deliver(
+            event,
+            facts,
+            settings,
+            services,
+            group,
+            notice.NOTICE_TEXT,
+            kind=SendKind.FIXED_NOTICE,
+            llm_invoked=False,
+        )
+        if sent:
+            services.notice.begin(group, actor_id=actor_id, version=settings.notice_version)
+        self._audit(services, redact.EventCategory.CONTEXT_OP)
+        return outcome
+
+    # ---- 控制：关闭 / 清空 / 暂停 / 恢复（S2-05） ----
+
+    async def _handle_group_control(
+        self,
+        event: AstrMessageEvent,
+        facts: MessageFacts,
+        settings: Settings,
+        services: _Services,
+        intent: commands.CommandIntent,
+    ) -> None:
+        """`群上下文 关闭`、`上下文 清空`、`千鹤 暂停/恢复`：状态变更，**静默无回执**。
+
+        顺序：先写状态（失败即停采）→ 再清缓冲 → 最后清受影响群历史。"暂停时保留成员
+        删除通道"由结构保证：`上下文 退出` 只读成员状态，不看 `paused`。
+        """
+        group = self._group_key(facts)
+        message_id = self._message_id(event)
+        if message_id is None:
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+        key = DedupKey(group=group, message_id=message_id, action=ActionKind.CHAT_REPLY)
+        if services.dedup.begin(key) is not Claim.FIRST:
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+        if not authorize(intent, facts, settings).allowed:
+            services.dedup.release(key)
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+
+        stored = services.storage
+        available = stored is not None and not stored.database.failed
+
+        if intent.kind is commands.CommandKind.CONTEXT_CLEAR:
+            # 清空是隐私动作：存储不可用时仍清内存与会话历史，只跳过修订号（在途失效收窄）。
+            if available:
+                try:
+                    stored.groups.bump_revision(group)
+                except storage.StorageFailure:
+                    self._storage_failed(services, facts, message_id, category=redact.EventCategory.CONTEXT_OP)
+            else:
+                self._audit(
+                    services,
+                    redact.EventCategory.CONTEXT_OP,
+                    parts=(facts.group_id, message_id),
+                    code=redact.ErrorCode.MEMORY_STORE_FAILED,
+                )
+            services.context_buffer.clear_group(group)
+            await self._clear_group_history(event, services)
+            self._audit(services, redact.EventCategory.CONTEXT_OP)
+            services.dedup.finish(key, Outcome.COMPLETED)
+            return
+
+        if not available:
+            self._storage_failed(services, facts, message_id, category=redact.EventCategory.CONTEXT_OP)
+            services.dedup.finish(key, Outcome.COMPLETED)
+            return
+
+        try:
+            if intent.kind is commands.CommandKind.GROUP_CONTEXT_CLOSE:
+                stored.groups.set_context_enabled(
+                    group,
+                    enabled=False,
+                    required_notice_version=settings.notice_version,
+                )
+                services.context_buffer.clear_group(group)
+                await self._clear_group_history(event, services)
+            elif intent.kind is commands.CommandKind.PAUSE:
+                self._set_paused(stored, group, paused=True)
+                services.context_buffer.clear_group(group)
+            else:  # RESUME
+                self._set_paused(stored, group, paused=False)
+        except storage.PolicyRefused:
+            # 本群没有策略行（从未告知）或版本不匹配：不生效，按忽略记录（不发提示）。
+            services.dedup.finish(key, Outcome.COMPLETED)
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+        except storage.StorageFailure:
+            self._storage_failed(services, facts, message_id, category=redact.EventCategory.CONTEXT_OP)
+            services.dedup.finish(key, Outcome.COMPLETED)
+            return
+
+        self._audit(services, redact.EventCategory.CONTEXT_OP)
+        services.dedup.finish(key, Outcome.COMPLETED)
+
+    @staticmethod
+    def _set_paused(stored: storage.Storage, group: GroupKey, *, paused: bool) -> None:
+        """暂停 / 恢复；**没有策略行时先建行**——从未开启采集的群也必须能静音。
+
+        `bump_revision` 建出的行是"未告知 + 未开启"，因此不会让采集意外打开。
+        """
+        try:
+            stored.groups.set_paused(group, paused=paused)
+        except storage.PolicyRefused:
+            stored.groups.bump_revision(group)
+            stored.groups.set_paused(group, paused=paused)
+
+    def _storage_failed(
+        self,
+        services: _Services,
+        facts: MessageFacts,
+        message_id: str,
+        *,
+        category: redact.EventCategory,
+    ) -> None:
+        """写路径的公共降级：置持久降级 + 留审计，调用方按"未发生"处理。"""
+        services.health.set_degraded(health.Degradation.MEMORY_STORE_FAILED)
+        self._audit(
+            services,
+            category,
+            parts=(facts.group_id, message_id),
+            code=redact.ErrorCode.MEMORY_STORE_FAILED,
+        )
+
     async def _clear_group_history(self, event: AstrMessageEvent, services: _Services) -> None:
         """清理该群互动历史；失败只登记降级，不重试、不虚报（重试属 S2-08）。"""
         cleaner = self.history_cleaner or self._delete_group_history
@@ -883,7 +1165,11 @@ class ChizuruPlugin(Star):
         gate = evaluate(
             request,
             settings,
-            GateFacts(group_state=self._group_state(settings, facts), current=current, previous=None),
+            GateFacts(
+                group_state=self._group_state(settings, facts, services, kind=kind),
+                current=current,
+                previous=None,
+            ),
         )
         if not gate.allowed:
             self._audit(services, redact.EventCategory.GATE_DROP, code=_drop_code(gate.drop))
@@ -916,17 +1202,33 @@ class ChizuruPlugin(Star):
             facts.group_id,
         )
 
-    @staticmethod
-    def _group_state(settings: Settings, facts: MessageFacts) -> GroupState:
-        """群开关：S1 的临时来源是部署配置；替换为持久化策略**延后到 S2-02**。
+    def _group_state(
+        self,
+        settings: Settings,
+        facts: MessageFacts,
+        services: _Services,
+        *,
+        kind: SendKind,
+    ) -> GroupState:
+        """群开关：部署允许名单 ∧ 持久化策略**未暂停**（S2-02 起替换 S1 的临时来源）。
 
-        聊天不要求告知、采集才要求：采集准入在 `_maybe_collect` 读策略仓储
-        （无行即关闭）。S2-02 之前没有写入"已告知 + 开启"的合法路径，此刻替换
-        只会让聊天静默停摆，不带来任何采集能力。
+        - `CHAT`：暂停即关闭（需求 §4.4"暂停/恢复本群聊天"）；
+        - `FIXED_NOTICE`：暂停**不**关闭——否则暂停群里的 `千鹤 状态` 与恢复不可达；
+        - 存储缺失或读失败 → 放行：R21"存储不是聊天的前置条件"，且无法读取不等于已暂停；
+        - `群上下文 关闭`（`context_enabled=0`）只停采集，**不**停聊天（需求 §4.4）。
         """
-        if settings.allows_group(facts.platform_id, facts.self_id, facts.group_id):
+        if not settings.allows_group(facts.platform_id, facts.self_id, facts.group_id):
+            return GroupState.CLOSED
+        if kind is not SendKind.CHAT:
             return GroupState.OPEN
-        return GroupState.CLOSED
+        stored = services.storage
+        if stored is None or stored.database.failed:
+            return GroupState.OPEN
+        try:
+            policy = stored.groups.policy(self._group_key(facts))
+        except storage.StorageFailure:
+            return GroupState.OPEN
+        return GroupState.CLOSED if policy.paused else GroupState.OPEN
 
     @staticmethod
     def _message_id(event: AstrMessageEvent) -> str | None:

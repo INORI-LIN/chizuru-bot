@@ -469,9 +469,11 @@ class StatusCommandTests(AssemblyTestCase):
         self.assertEqual(provider.calls, [])
 
     async def test_other_commands_are_silent(self):
+        """**行为分化（S2-05）**：`群上下文 开启` 已改为回复告知全文（见
+        `MaintainerCommandTests`），不再是零出站；本用例保留其余仍静默的指令。"""
         provider = fakes.FakeProvider()
         await self.start(provider=provider, platform=fakes.FakePlatform())
-        for text in ("帮助", "上下文 退出", "记忆 开启", "群上下文 开启", "千鹤 暂停"):
+        for text in ("帮助", "上下文 退出", "记忆 开启", "千鹤 暂停"):
             with self.subTest(command=text):
                 await self.plugin.on_message(self.mention(text, message_id=f"event-{text}"))
                 self.assertEqual(self.sent, [])
@@ -1072,6 +1074,266 @@ class RevisionGateTests(AssemblyTestCase):
         await self.start(provider=provider, history_store=fakes.FakeHistoryStore(), storage_path=None)
         await self.plugin.on_message(self.mention("你好", message_id="chat-1"))
         self.assertEqual(len(self.sent), 1)
+
+
+class MaintainerCommandTests(AssemblyTestCase):
+    """S2-02/S2-05：群告知两步开启与维护者命令（B1a、需求 §4.4、架构 §6.3）。"""
+
+    def open_notice(self, **overrides):
+        return self.mention("群上下文 开启", **overrides)
+
+    def confirm_notice(self, **overrides):
+        return self.mention("群上下文 确认开启", **overrides)
+
+    async def start_with_storage(self, *, provider=None, config=None, cleaner=None):
+        await self.start(
+            provider=provider or fakes.FakeProvider(),
+            storage_path=self.new_storage_path(),
+            history_cleaner=cleaner or fakes.FakeHistoryCleaner(),
+            history_store=fakes.FakeHistoryStore(),
+            config=config,
+        )
+
+    def policy(self):
+        return self.plugin.services.storage.groups.policy(self.group_key())
+
+    def notice_row(self):
+        """直接读库核对"告知版本可追溯"：版本、时间、告知人三者都要落盘。"""
+        import sqlite3
+
+        connection = sqlite3.connect(self.plugin.storage_path)
+        try:
+            return connection.execute(
+                "SELECT notice_version, notice_at, notice_by FROM group_policy"
+            ).fetchone()
+        finally:
+            connection.close()
+
+    async def test_open_replies_with_the_approved_notice_and_keeps_collection_closed(self):
+        await self.start_with_storage()
+        await self.plugin.on_message(self.open_notice())
+
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(text_of(self.sent[0]), plugin_module.notice.NOTICE_TEXT)
+        # 步骤 1 只回复文案：既没有策略行，也不该建库（读取不建文件）。
+        self.assertFalse(self.policy().exists)
+        self.assertFalse(self.plugin.storage_path.exists())
+
+    async def test_confirm_opens_collection_and_never_backfills(self):
+        await self.start_with_storage()
+        # 告知完成前的普通消息不入缓冲（"不补采历史消息"）。
+        await self.plugin.on_message(self.plain("告知前说的话", message_id="before"))
+        self.assertEqual(self.collected(), ())
+
+        await self.plugin.on_message(self.open_notice(message_id="open-1"))
+        await self.plugin.on_message(self.confirm_notice(message_id="confirm-1"))
+
+        self.assertTrue(self.policy().context_enabled)
+        self.assertEqual(self.policy().notice_version, plugin_module.notice.NOTICE_VERSION)
+        version, notice_at, notice_by = self.notice_row()
+        self.assertEqual(version, plugin_module.notice.NOTICE_VERSION)
+        self.assertEqual(notice_by, "30001")
+        self.assertIsInstance(notice_at, int)
+        # 确认之后的消息才被采集，且缓冲里没有告知前那条。
+        await self.plugin.on_message(self.plain("告知后说的话", message_id="after"))
+        self.assertEqual([entry.text for entry in self.collected()], ["告知后说的话"])
+
+    async def test_expired_confirmation_resends_the_notice_and_can_be_retried(self):
+        await self.start_with_storage()
+        await self.plugin.on_message(self.open_notice(message_id="open-1"))
+        self.clock.advance(plugin_module.notice.CONFIRM_WINDOW_SECONDS + 1)
+
+        await self.plugin.on_message(self.confirm_notice(message_id="confirm-1"))
+        self.assertEqual(text_of(self.sent[0]), plugin_module.notice.NOTICE_TEXT)
+        self.assertFalse(self.policy().context_enabled)
+
+        # 重发同时重开了窗口：立刻再确认即成功（B1a"要求重新发起"）。
+        await self.plugin.on_message(self.confirm_notice(message_id="confirm-2"))
+        self.assertTrue(self.policy().context_enabled)
+        self.assertEqual(len(self.sent), 0)
+
+    async def test_other_maintainer_must_restart_the_flow(self):
+        config = make_config(group_maintainers={"20001": ["30001", "30002"]})
+        await self.start_with_storage(config=config)
+        await self.plugin.on_message(self.open_notice(sender_id="30001", message_id="open-1"))
+        await self.plugin.on_message(self.confirm_notice(sender_id="30002", message_id="confirm-1"))
+
+        self.assertEqual(text_of(self.sent[0]), plugin_module.notice.NOTICE_TEXT)
+        self.assertFalse(self.policy().context_enabled)
+        await self.plugin.on_message(self.confirm_notice(sender_id="30002", message_id="confirm-2"))
+        self.assertTrue(self.policy().context_enabled)
+
+    async def test_version_mismatch_is_silent_and_never_opens(self):
+        config = make_config(notice_version="notice-9")
+        await self.start_with_storage(config=config)
+        await self.plugin.on_message(self.open_notice(message_id="open-1"))
+        self.assertEqual(self.sent, [])
+        await self.plugin.on_message(self.confirm_notice(message_id="confirm-1"))
+        self.assertEqual(self.sent, [])
+        self.assertFalse(self.policy().context_enabled)
+
+    async def test_non_maintainer_changes_nothing(self):
+        await self.start_with_storage()
+        await self.plugin.on_message(self.open_notice(sender_id="30002", message_id="open-1"))
+        await self.plugin.on_message(self.confirm_notice(sender_id="30002", message_id="confirm-1"))
+        self.assertEqual(self.sent, [])
+        self.assertFalse(self.policy().exists)
+
+    async def test_without_storage_the_notice_is_still_returned(self):
+        broken = self.new_storage_path()
+        broken.write_bytes(b"not a sqlite database")
+        await self.start(provider=fakes.FakeProvider(), storage_path=broken, history_cleaner=fakes.FakeHistoryCleaner())
+        self.assertIsNone(self.plugin.services.storage)
+
+        await self.plugin.on_message(self.open_notice(message_id="open-1"))
+        self.assertEqual(text_of(self.sent[0]), plugin_module.notice.NOTICE_TEXT)
+        await self.plugin.on_message(self.confirm_notice(message_id="confirm-1"))
+        self.assertEqual(len(self.sent), 0)  # 无法持久化就不虚报成功
+        self.assertIn(
+            plugin_module.health.Degradation.MEMORY_STORE_FAILED,
+            self.plugin.services.health.degradations(),
+        )
+
+    async def test_close_stops_collection_and_clears_buffer_and_history(self):
+        cleaner = fakes.FakeHistoryCleaner()
+        await self.start_with_storage(cleaner=cleaner)
+        self.open_group()
+        await self.plugin.on_message(self.plain("关闭前说的话"))
+        self.assertEqual(len(self.collected()), 1)
+
+        await self.plugin.on_message(self.mention("群上下文 关闭", message_id="close-1"))
+        self.assertEqual(self.sent, [])
+        self.assertFalse(self.policy().context_enabled)
+        self.assertEqual(self.collected(), ())
+        self.assertEqual(len(cleaner.calls), 1)
+
+        await self.plugin.on_message(self.plain("关闭后的消息", message_id="after"))
+        self.assertEqual(self.collected(), ())
+
+    async def test_close_invalidates_inflight_reply(self):
+        def close_group():
+            self.plugin.services.storage.groups.set_context_enabled(
+                self.group_key(),
+                enabled=False,
+                required_notice_version=plugin_module.notice.NOTICE_VERSION,
+            )
+
+        provider = MutatingProvider(action=close_group)
+        await self.start(
+            provider=provider,
+            storage_path=self.new_storage_path(),
+            history_cleaner=fakes.FakeHistoryCleaner(),
+            history_store=fakes.FakeHistoryStore(),
+        )
+        self.open_group()
+        await self.plugin.on_message(self.mention("你好", message_id="chat-1"))
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(self.sent, [])
+
+    async def test_pause_blocks_chat_clears_buffer_and_resume_restores(self):
+        provider = fakes.FakeProvider()
+        cleaner = fakes.FakeHistoryCleaner()
+        await self.start_with_storage(provider=provider, cleaner=cleaner)
+        self.open_group()
+        await self.plugin.on_message(self.plain("暂停前说的话"))
+        self.assertEqual(len(self.collected()), 1)
+
+        await self.plugin.on_message(self.mention("千鹤 暂停", message_id="pause-1"))
+        self.assertTrue(self.policy().paused)
+        self.assertEqual(self.collected(), ())
+
+        await self.plugin.on_message(self.mention("你好", message_id="chat-1"))
+        self.assertEqual(provider.calls, [])
+        self.assertEqual(self.sent, [])
+
+        # 暂停不挡状态查询与恢复（FIXED_NOTICE 豁免）。
+        await self.plugin.on_message(self.mention("千鹤 状态", message_id="status-1"))
+        self.assertIn("群上下文：已暂停（notice-1）", text_of(self.sent[0]))
+
+        await self.plugin.on_message(self.mention("千鹤 恢复", message_id="resume-1"))
+        self.assertFalse(self.policy().paused)
+        await self.plugin.on_message(self.mention("你好", message_id="chat-2"))
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(len(self.sent), 1)
+
+    async def test_pause_keeps_the_member_leave_channel_open(self):
+        await self.start_with_storage()
+        self.open_group()
+        await self.plugin.on_message(self.mention("千鹤 暂停", message_id="pause-1"))
+        await self.plugin.on_message(self.mention("上下文 退出", message_id="leave-1"))
+
+        member = plugin_module.MemberKey(self.group_key(), "30001")
+        self.assertTrue(self.plugin.services.storage.members.state(member).opted_out)
+        self.assertEqual(self.sent, [])
+        await self.plugin.on_message(self.plain("退出后的消息", message_id="after"))
+        self.assertEqual(self.collected(), ())
+
+    async def test_pause_without_policy_row_creates_a_closed_row(self):
+        provider = fakes.FakeProvider()
+        await self.start_with_storage(provider=provider)
+        await self.plugin.on_message(self.mention("千鹤 暂停", message_id="pause-1"))
+
+        policy = self.policy()
+        self.assertTrue(policy.exists)
+        self.assertTrue(policy.paused)
+        self.assertEqual(policy.notice_version, "")
+        self.assertFalse(policy.context_enabled)
+        await self.plugin.on_message(self.mention("你好", message_id="chat-1"))
+        self.assertEqual(provider.calls, [])
+
+    async def test_clear_keeps_the_switch_state_and_bumps_revision(self):
+        cleaner = fakes.FakeHistoryCleaner()
+        await self.start_with_storage(cleaner=cleaner)
+        self.open_group()
+        await self.plugin.on_message(self.plain("清空前的消息"))
+        before = self.policy()
+
+        await self.plugin.on_message(self.mention("上下文 清空", message_id="clear-1"))
+        after = self.policy()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.collected(), ())
+        self.assertEqual(len(cleaner.calls), 1)
+        self.assertTrue(after.context_enabled)
+        self.assertEqual(after.notice_version, before.notice_version)
+        self.assertEqual(after.revision, before.revision + 1)
+
+    async def test_clear_without_storage_still_clears_memory(self):
+        broken = self.new_storage_path()
+        broken.write_bytes(b"not a sqlite database")
+        cleaner = fakes.FakeHistoryCleaner()
+        await self.start(
+            provider=fakes.FakeProvider(),
+            storage_path=broken,
+            history_cleaner=cleaner,
+            history_store=fakes.FakeHistoryStore(),
+        )
+        member = plugin_module.MemberKey(self.group_key(), "30001")
+        self.plugin.services.context_buffer.ingest(
+            group=self.group_key(),
+            member=member,
+            message_id="m1",
+            text="需要被清掉的内容",
+            shape=plugin_module.BufferShape.TEXT_ONLY,
+        )
+        self.assertEqual(len(self.collected()), 1)
+
+        await self.plugin.on_message(self.mention("上下文 清空", message_id="clear-1"))
+        self.assertEqual(self.collected(), ())
+        self.assertEqual(len(cleaner.calls), 1)
+        self.assertEqual(self.sent, [])
+
+    async def test_status_line_follows_the_policy_states(self):
+        await self.start_with_storage()
+        await self.plugin.on_message(self.mention("千鹤 状态", message_id="status-0"))
+        self.assertIn("群上下文：未告知", text_of(self.sent[0]))
+
+        self.open_group()
+        await self.plugin.on_message(self.mention("千鹤 状态", message_id="status-1"))
+        self.assertIn("群上下文：已开启（notice-1）", text_of(self.sent[0]))
+
+        await self.plugin.on_message(self.mention("群上下文 关闭", message_id="close-1"))
+        await self.plugin.on_message(self.mention("千鹤 状态", message_id="status-2"))
+        self.assertIn("群上下文：已关闭（notice-1）", text_of(self.sent[0]))
 
 
 if __name__ == "__main__":

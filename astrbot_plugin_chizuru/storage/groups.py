@@ -237,6 +237,17 @@ class GroupPolicyStore:
                 revision=revision,
             )
 
+    def bump_revision(self, group: GroupKey) -> int:
+        """只增群修订号（`上下文 清空` 与"无策略行的暂停"共用），返回新值。
+
+        **不幂等**：每次调用都 +1，因为它就是"让在途结果失效"的机制本身。
+        没有策略行时按关闭状态建行（`revision=1`，`context_enabled=0`、`paused=0`、
+        告知版本为空）——采集判定与状态行都不会因此变成"已告知"。
+        """
+        now = self._clock()
+        with self._database.transaction() as connection:
+            return bump_group_revision(connection, group, at=now)
+
 
 def _is_plain_text(value: object) -> bool:
     return isinstance(value, str) and bool(value) and value == value.strip()
