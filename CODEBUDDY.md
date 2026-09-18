@@ -10,8 +10,9 @@ This file provides guidance to CodeBuddy Code when working with code in this rep
 以《租借女友》水原千鹤为人设参考。**非官方、仅被 @ 时回复、不主动接话**。
 
 **当前状态：未上线。** S0 离线核验完成，但 **S0 阶段门于 2026-09-17 被维护者决定有意跳过（不是通过）**，
-在线部分（真实 QQ/NapCat/DeepSeek）从未验证。S1 进行中：`S1-01/02/03/04/05/06/07/08/09/12/13` 与
-`S1-10`（**仅离线部分**）已完成，`S1-11`、`S1-14`—`S1-16` 未开始；S2/S3/S4 未开始。
+在线部分（真实 QQ/NapCat/DeepSeek）从未验证。S1 进行中：`S1-01`—`S1-15` 的**离线部分**均已完成
+（含 `main.py` 装配与离线回归），`S1-16` 阶段门与 `S1-10` 的在线部分仍【阻塞·在线/凭据】；
+S2/S3/S4 未开始。
 
 | 文档 | 角色 |
 |---|---|
@@ -29,7 +30,7 @@ export ASTRBOT_BUILD_DASHBOARD=0   # 阻止上游构建钩子运行 npm
 ```
 
 ```sh
-# 全量离线核验：7 个核验脚本 + 全部单元测试（当前共 282 项单元测试）
+# 全量离线核验：7 个核验脚本 + 全部单元测试（当前共 318 项单元测试）
 bash scripts/s0/run_all.sh
 
 # 只跑全部单元测试
@@ -75,7 +76,7 @@ uv lock --check --offline --project "$PWD/.runtime/astrbot" --no-python-download
 
 ## 架构
 
-### 目标数据流（S1 装配尚未完成，S1-14 落地）
+### 目标数据流（S1 装配已完成，离线部分）
 
 ```
 OneBot 事件 → main.py（唯一框架入口、薄适配，提取 MessageFacts）
@@ -86,13 +87,16 @@ OneBot 事件 → main.py（唯一框架入口、薄适配，提取 MessageFacts
   → llm.py（S1-10 离线部分，直接调用原生提供商）→ send_gate.evaluate（S1-12）→ 唯一出站路径
 ```
 
+`main.py` 已按此装配（S1-14）：唯一出站路径是 `_deliver()`，群内出口目前只有 `千鹤 状态`。
+
 ### 模块边界（每个模块"必须不做"与职责同等重要）
 
 | 模块 | 职责 | 必须不做 |
 |---|---|---|
-| `main.py` | Star 生命周期、钩子注册、唯一装配点与出站路径 | 不写业务规则、不解析身份、不直接 `event.send` |
+| `main.py` | Star 生命周期、钩子注册（**只注册 `on_message`**）、唯一装配点与出站路径 `_deliver()` | 不写业务规则、不解析身份、不直接 `event.send`（出站必经 `send_gate`） |
 | `config.py` | fail-closed 配置模型：任一字段缺失或畸形 → 整体退回哨兵 `Settings()`（拒绝全部） | 不默认开启采集/记忆；密钥不进 `repr` |
 | `policy.py` | 纯触发形态分类：`IGNORE` / `EMPTY_OR_UNSUPPORTED` / `UNSUPPORTED_ATTACHMENT` / `TEXT_CANDIDATE`；`is_trusted_scope` 是权限与触发**共用的唯一谓词** | 不判权限、不读 DB、不判采集资格（属 S2）、不做指令分流 |
+| `context_assembly.py` | 人格分层与静态规则（S1-11 已实现静态部分）：`STATIC_RULES`/`PERSONA_VERSION`/`build_chat_plan()`；固定规则只进 system，动态材料只能经 `dynamic_parts`（S2-06） | 不组装上下文材料、不调模型、不接受事件对象（因而读不到 `message_str`） |
 | `keys.py` | `BotInstanceKey` / `GroupKey` / `MemberKey`、`RevisionSnapshot`；只由可信元数据构造，缺一段即构造失败 | 不用昵称/群名/正文构造键 |
 | `commands.py` | 纯解析 `CommandIntent` + 所需权限档；空白归一化 | 不核权、不执行、不调模型；**调用前提是调用方已确认真实 @** |
 | `control.py` | 确定性授权：可信身份 + 显式配置映射 | 不读事件对象、不导入框架、不调模型；QQ 群管理员 ≠ 系统管理员 ≠ 维护者 |
@@ -104,7 +108,7 @@ OneBot 事件 → main.py（唯一框架入口、薄适配，提取 MessageFacts
 | `redact.py` | 类别化日志记录（`AuditRecord` 无自由文本字段）、错误码闭集、每进程加盐的关联标识、保留期与大小策略、AstrBot/NapCat 日志审计清单 | 不做日志 IO、不轮转文件（`logging` 都不导入）；不记正文/请求体/密钥/推理文本；关联摘要不可还原、跨重启不可关联（刻意取舍） |
 | `llm.py` | 请求成形（`LLMRequestPlan`，键集固定、无工具参数）、回复解释（只读 `role`/`completion_text`）、错误分类（状态码委托 `redact.ErrorCode`）、≤1 次重试判定（共用同一 `Deadline`）、usage 映射、`FollowUp` 类别 | 不发送、不导入框架、不建网关/客户端；不组装人格与上下文（S1-11）；不读写历史与存储；**不读取推理字段、不追加工具**；不含任何群内文案；**在线部分未验证**（真实 401/402/429/5xx 与 usage 仍待 S0-07） |
 
-**尚不存在**（属后续任务卡，不要 import）：`context_assembly.py`（S1-11）、`storage/`、`memory/`。
+**尚不存在**（属后续任务卡，不要 import）：`context_buffer.py`（S2-03）、`storage/`、`memory/`。
 docs/03 §3.2 的目录树是**拟议结构**，不是现状清单——判断某文件是否存在请直接看仓库。
 
 ### 不可违背的硬约束
@@ -164,7 +168,12 @@ docs/03 §3.2 的目录树是**拟议结构**，不是现状清单——判断�
   `astrbot_plugin_chizuru.*` 导入模块，靠 `python -m` 把 CWD 放进 `sys.path`。
 - `tests/test_plugin.py` 使用**真实** AstrBot 框架对象（导入 AstrBot、解析 `metadata.yaml`、
   注入 `_conf_schema.json`、经 `call_handler` 复刻 `star_request.py` 的处理器调用循环）；
-  其余 `test_*.py` 只导入 `astrbot_plugin_chizuru/` 下的纯逻辑模块。
+  `tests/test_assembly.py` 同样用真实框架对象 + `tests/fakes.py`（假时钟/提供商/平台、
+  事件工厂、send 记录器、K12 作用域守卫）；其余 `test_*.py` 只导入 `astrbot_plugin_chizuru/`
+  下的纯逻辑模块。
+- **装配级测试必须替换 `event.send`**：真实实现会 `asyncio.create_task(Metric.upload(...))`
+  并联网，离线守卫会拒绝且破坏"terminate 后无新增任务"的不变量。`tests/fakes.py` 不是
+  测试模块（文件名不匹配 `test*.py`），也不要 import `scripts/s0/`。
 - S0 核验脚本在独立进程运行，共享引导在 `scripts/s0/_harness.py`（`Harness` + `Checker`）；
   **每个进程只能建立一个 `Harness`**（audit hook 不可卸载）。新脚本照抄该模板即可获得
   隔离 `ASTRBOT_ROOT`、11 类事件门控矩阵所需的真假事件与出站/模型调用记录器。

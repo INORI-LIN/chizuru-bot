@@ -85,9 +85,12 @@ async def main() -> int:
             evidence=f"sends={plain['sends']}",
         )
 
+        # 2026-09-18 修正（K5）：`call_llm=False` 是无效调用，不抑制任何链路；真正关闭
+        # 框架默认 LLM 路径的是 `should_call_llm(True)`（置 call_llm=True）。本脚本原断言
+        # 期望 call_llm=False（S0 时点的骨架姿态），按修正后的语义改判据——判据变强而非变弱。
         checker.check(
-            "本插件显式关闭默认 LLM 链路（call_llm=False）",
-            plain["call_llm"] is False,
+            "本插件显式关闭框架默认 LLM 链路（should_call_llm(True) → call_llm=True）",
+            plain["call_llm"] is True,
             evidence=f"call_llm={plain['call_llm']}",
         )
 
