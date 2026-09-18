@@ -11,6 +11,7 @@ from astrbot_plugin_chizuru.history import (
     select,
     should_record,
     storage_entries,
+    trim_stored,
 )
 
 NOW = 1_760_000_000
@@ -149,6 +150,88 @@ class FlattenTests(unittest.TestCase):
         entries += list(pair(user_text="第二问", assistant_text="第二答", at=NOW + 1))
         contexts = flatten(parse(json.dumps(entries)))
         self.assertEqual([entry["content"] for entry in contexts], ["第一问", "第一答", "第二问", "第二答"])
+
+
+class TrimStoredTests(unittest.TestCase):
+    """S2-08：启动裁剪的写回计划——只动 `_at` 成对条目，其余原样保留。"""
+
+    def trim(self, entries, *, max_turns=20, ttl_seconds=86_400, now_epoch=NOW):
+        return trim_stored(
+            json.dumps(entries),
+            max_turns=max_turns,
+            ttl_seconds=ttl_seconds,
+            now_epoch=now_epoch,
+        )
+
+    def test_expired_turns_are_dropped_and_fresh_ones_kept(self):
+        entries = list(pair(user_text="过期", at=NOW - 90_000)) + list(pair(user_text="新鲜", at=NOW - 60))
+        trimmed = self.trim(entries)
+        self.assertIsNotNone(trimmed)
+        assert trimmed is not None
+        self.assertEqual([entry["content"] for entry in trimmed], ["新鲜", "听起来不错"])
+
+    def test_boundary_is_strict(self):
+        # 恰好到期即过期：整轮被裁掉是**真实改动**（写回空列表），不是"无需改动"。
+        entries = list(pair(at=NOW - 86_400))
+        self.assertEqual(self.trim(entries), ())
+
+    def test_over_limit_pairs_are_dropped_oldest_first(self):
+        entries = []
+        for index in range(5):
+            entries.extend(pair(user_text=f"第 {index} 问", at=NOW + index))
+        trimmed = self.trim(entries, max_turns=2)
+        assert trimmed is not None
+        self.assertEqual(
+            [entry["content"] for entry in trimmed],
+            ["第 3 问", "听起来不错", "第 4 问", "听起来不错"],
+        )
+
+    def test_unrecognised_entries_are_preserved(self):
+        entries = [
+            {"role": "_checkpoint", "content": {"a": 1}},
+            *pair(user_text="过期", at=NOW - 90_000),
+            {"role": "user", "content": "没有时间戳的历史"},
+            *pair(user_text="新鲜", at=NOW - 60),
+        ]
+        trimmed = self.trim(entries)
+        assert trimmed is not None
+        self.assertEqual(
+            trimmed,
+            (
+                {"role": "_checkpoint", "content": {"a": 1}},
+                {"role": "user", "content": "没有时间戳的历史"},
+                {"role": "user", "content": "新鲜", AT_KEY: NOW - 60},
+                {"role": "assistant", "content": "听起来不错", AT_KEY: NOW - 60},
+            ),
+        )
+
+    def test_no_change_means_no_write(self):
+        for entries in (
+            [],
+            [{"role": "_checkpoint", "content": {}}],
+            [{"role": "user", "content": "框架原生的历史"}],
+            list(pair(at=NOW - 60)),
+        ):
+            with self.subTest(entries=entries):
+                self.assertIsNone(self.trim(entries))
+
+    def test_malformed_input_is_not_a_write_plan(self):
+        for raw in (None, "", "   ", "not json", "{}", "[1, 2]"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(
+                    trim_stored(raw, max_turns=20, ttl_seconds=86_400, now_epoch=NOW)
+                )
+
+    def test_invalid_window_is_rejected(self):
+        for kwargs in ({"max_turns": 0}, {"max_turns": True}, {"ttl_seconds": 0}, {"ttl_seconds": -1}):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    trim_stored(
+                        json.dumps(list(pair(at=NOW))),
+                        max_turns=kwargs.get("max_turns", 20),
+                        ttl_seconds=kwargs.get("ttl_seconds", 86_400),
+                        now_epoch=NOW,
+                    )
 
 
 class ShouldRecordTests(unittest.TestCase):

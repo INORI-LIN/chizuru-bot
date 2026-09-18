@@ -1,6 +1,6 @@
 # 千鹤 QQ 群聊天机器人：实施拆分与任务卡
 
-- 文档版本：0.17
+- 文档版本：0.18
 - 日期：2026-09-18
 - 阶段：实施拆分（规划产物；落地进度见 §5.2 与文首版本记录）
 - 需求依据：[需求拆分](./01-requirements.md)
@@ -27,6 +27,7 @@
 | 0.15 | 2026-09-18 | 用户授权 **S2 离线先行**（第 9.5 节记录决定，性质同 S0 的"有意跳过"）；目标群与维护者清单延续"暂不提供"，S2-02/S2-05 保持【阻塞】。**S2-01/S2-03/S2-04 完成（离线部分）**：新增 `storage/{db,schema,groups,members}.py`、`context_buffer.py`、`tests/test_storage_*.py` 49 项、`tests/test_context_buffer.py` 26 项、`tests/test_assembly.py` 增 14 项；回归共 **407 项**通过。首次落库：延迟建库、短事务、`user_version` 校验、失败不恢复；`group_policy`/`member_state` 两张表均无记忆授权列。采集分支与 `上下文 退出/加入` 接入 `main.py`（生产默认关闭）；**`_group_state` 替换延后到 S2-02**、修订号只写不读（§5.2 实施判断）。新增 `EventCategory.CONTEXT_OP` 与风险 **R21**；顺手修正 §9.1 B4 与附录 C 头部把已完成 S1-11 仍列在待审名单的笔误。S1-16/S2-10 阶段门均未通过 |
 | 0.16 | 2026-09-18 | **S2-06/S2-07 完成（离线部分）**（批次 2d，用户确认三项设计决定）：新增 `history.py`（轮次映射/筛选/私有键剥离）、`context_assembly.py` 增动态材料装配（短标签 + 转义昵称 + 时间 + token 预算裁剪 + 拒绝分支）、`context_buffer.py` 条目带昵称；`main.py` 接线：材料经 `extra_user_content_parts` 并 `mark_as_temp()`、历史经 `contexts`、**发送前修订号复核**、仅送达写回历史（写前二次比对）。测试 407 → **482 项**（`test_history.py` 18、`test_context_assembly.py` 10→43、`test_context_buffer.py` 26→32、`test_assembly.py` 40→58）；`run_all.sh` 七脚本全绿。**`_at` 私有键随条目落会话存储**，不新增 SQLite 表（schema 仍 v1）；`memory_assisted` 注入位留待 S3-08 联调。§3.2/§3.3/§5.2/§5.3/§8/§9.5 同步（附录 A 的 R/A 映射不变）；架构文档升至 0.4（§3/§4.3/§5.1/§5.2/§6.1/§6.2/§14）。S1-16/S2-10 阶段门仍未通过 |
 | 0.17 | 2026-09-18 | **前置解除 + S2-02/S2-05 完成（离线部分）**：用户确认**维护者清单与目标群已定**（值只进运行时配置、不写入仓库）并**批准附录 C.1 告知文案定稿**，两卡的【阻塞】与【待审】标签同时解除（§9.2、§9.1 B4、附录 C 头部回写）。实施：新增 `notice.py`（C.1 逐字 + `notice-1` 指纹 + 每群单槽 5 分钟待确认窗口 + 状态行取值）、`storage/groups.py` 增 `bump_revision`；`main.py` 接线六条维护者命令（开启/确认开启/关闭/清空/暂停/恢复），**`_group_state` 改为读持久化策略**（CHAT 受暂停约束、FIXED_NOTICE 豁免、无存储放行）、暂停期聊天在调模型前早停、`千鹤 状态` 追加群上下文行。测试 482 → **522 项**（`test_notice.py` 21、`test_storage_groups.py` 增 4、`test_assembly.py` 增 15）；`run_all.sh` 七脚本全绿。**行为分化两处**：`群上下文 开启` 由静默改为回复告知全文（§5.2 记录），FIXED_NOTICE 豁免暂停。新增风险 **R22**。S1-16/S2-10 阶段门仍未通过 |
+| 0.18 | 2026-09-18 | **S2-08/S2-09 完成（离线部分）**：清理覆盖补全（默认清理路径 = 会话历史 + **平台消息历史**，后者用 `offset_sec=99999999`——上游默认 86400 的语义是"删最近 24 小时"且 docstring 写反，新增 **K15**）；新增**启动裁剪**（`history.trim_stored` 只裁带 `_at` 的成对条目、未识别条目原样保留；空 `platform_id` 跳过；失败只登记不置粘滞降级）；新增**清理失败计数**（`HealthMonitor.record_cleanup_failure`）+ `千鹤 状态` 可选行（待评审）；在途失效复核（清空/暂停在途丢弃）。测试 522 → **545 项**（`test_history.py` +7、`test_health.py` +2、`test_assembly.py` +14）；`run_all.sh` 七脚本全绿。新假件：`FakeConversationManager`/`FakeMessageHistoryManager`/`FakeHistoryStore.sweep`。新增风险 **R23**；新增**附录 E**（S2 离线判据 × 用例映射）。S1-16/S2-10 阶段门仍未通过 |
 
 ## 0. 状态标记与文档约定
 
@@ -177,7 +178,7 @@ scripts/               【新增目录】S0 核验脚本；不属于产品插件
 | `control.py` | 按可信事件身份 + 显式配置映射判权限；**不**读事件对象、不导入框架、不调模型，只接受已提取的事实 | 不做状态变更（S2-01/S2-08）；不让 LLM 参与；不代他人开启记忆；不展示他人信息 | R-CTRL、R-ADM、R-DATA | 新增 |
 | `context_buffer.py` | 内存环形缓冲：30 条与 10 分钟取严；退出/暂停/关闭即清；排除自身输出、命令、媒体、合并转发、可识别引用；过滤明显敏感文本；条目附带昵称（**仅展示**） | 不落盘；不请求模型；不发消息；不采集未告知群；昵称不进键、不参与判定 | R-CTX、R-DATA | 新增，**已实现（S2-03）**：纯内存 deque、惰性淘汰、无后台任务；退出即清已接线，暂停/关闭的清理随 S2-05；昵称字段见 §5.2（S2-06） |
 | `context_assembly.py` | 组装临时动态材料（群缓冲、本人记忆、时间、短标签）；本地稳定 ID → 标签映射；昵称转义与限长；同事件去重；token 预算裁剪；`contexts`/`dynamic_parts` 成形；超预算拒绝 | 不写入 system 角色；不写永久历史；不把账号 ID 原样发给模型；不发明群内文案；不导入框架（临时标记由 `main.py` 施加） | R-CTX、R-CHAT、R-PER、R-DATA | 新增，**已实现**：S1-11 的 `STATIC_RULES`/`PERSONA_VERSION`/`build_chat_plan()` + S2-06 的 `render_materials()`/`trim_to_budget()`（见 §5.2） |
-| `history.py` | `@` 互动历史的轮次映射与筛选：`_at` 私有键、成对解析、20 轮/24 小时取严、私有键剥离、写回条列表、`should_record`（送达 ∧ 非记忆辅助轮） | 不导入框架、不做 IO；不写正文到日志；不复制全历史（存储归框架会话存储）；不判权限 | R-CTX、R-DATA | 新增，**S2-07 已实现**（离线部分） |
+| `history.py` | `@` 互动历史的轮次映射与筛选：`_at` 私有键、成对解析、20 轮/24 小时取严、私有键剥离、写回条列表、`should_record`（送达 ∧ 非记忆辅助轮）、**`trim_stored`（启动裁剪的写回计划）** | 不导入框架、不做 IO；不写正文到日志；不复制全历史（存储归框架会话存储）；不判权限；裁剪**只动带 `_at` 的成对条目** | R-CTX、R-DATA | 新增，**S2-07/S2-08 已实现**（离线部分） |
 | `notice.py` | 群告知文案与两步确认窗口（S2-02）：`NOTICE_TEXT`/`NOTICE_VERSION`（逐字取自附录 C.1，指纹可追溯）、每群单槽待确认窗口（5 分钟取严、换人即作废、有界）、`describe_policy` 状态行取值 | 不导入框架/sqlite/asyncio、不做 IO、不调模型、不发消息、不判权限、不读配置（版本由调用方传入） | R-DATA、R-ADM、R-CTX | 新增，**S2-02 已实现**（离线部分）；文案 2026-09-18 定稿 |
 | `llm.py` | 请求成形（`LLMRequestPlan`，键集固定、无工具参数）、回复解释（只读 `role`/`completion_text`）、错误分类（状态码委托 `redact.ErrorCode`，标记表兜底）、≤1 次重试判定（共用同一 `Deadline`）、usage 映射与"该发什么类别"（`FollowUp`） | 不发送；不导入框架；不建网关或客户端；不组装人格与上下文（属 `context_assembly.py`）；不读写历史与存储；不 reserve 也不结算金额；不读取推理字段；不追加工具；不含任何群内文案 | R-CHAT、R-OPS | 新增，**已实现离线部分**（见 §5.2 实施判断） |
 | `budget.py` | 调度前预留、返回后按 usage 结算；日/月上限与暂停；抽取预算门槛 | 不硬编码价目；不把缺失 usage 计为零 | R-OPS、R-MEM | 新增 |
@@ -185,7 +186,7 @@ scripts/               【新增目录】S0 核验脚本；不属于产品插件
 | `send_gate.py` | 出站前复核：源范围 → 源触发形态 → 目标群一致 → 群开关 → 修订号 → 发送不确定；不一致即丢弃 | 不发送；不调模型；不做补救；群开关与修订号由调用方注入（无默认值）；不提供任何回执或送达 API；固定提示构造时即禁止模型调用 | R-TRG、R-DATA、R-OPS | 新增，**已实现**（见 §5.2 实施判断） |
 | `dedup.py` | 事件去重 + 记忆写入去重（源消息 + 动作） | 不保存原文；不无限保留 | R-OPS | 新增 |
 | `redact.py` | 类别化日志记录（`AuditRecord` 无自由文本字段）、错误码闭集、每进程加盐的关联标识、保留期与大小策略、AstrBot/NapCat 日志审计清单 | 不做日志 IO；不轮转文件；不记正文、请求体、密钥、推理文本；关联摘要不可还原且跨重启不可关联 | R-OPS、R-DATA | 新增，**已实现**（见 §5.2 实施判断） |
-| `health.py` | 平台状态归一化（只认 `Platform.status` 四个取值）、持久降级标志、抽取失败计数、供维护者查询的快照与文本 | 不导入框架；不探测；不发送；不表示 QQ 登录态；不读 `instance.config` 与任何错误文本/堆栈 | R-QQ、R-OPS、R-ADM | 新增，**已实现**（见 §5.2 实施判断） |
+| `health.py` | 平台状态归一化（只认 `Platform.status` 四个取值）、持久降级标志、抽取失败计数、**清理失败计数（S2-08 的待维护错误登记）**、供维护者查询的快照与文本 | 不导入框架；不探测；不发送；不表示 QQ 登录态；不读 `instance.config` 与任何错误文本/堆栈 | R-QQ、R-OPS、R-ADM | 新增，**已实现**（见 §5.2 实施判断） |
 | `storage/*` | 插件专用 SQLite；短事务；修订号；删除覆盖 | 不在事务内等网络；不存全量群聊；不被原生数据库替代 | R-MEM、R-DATA、R-CTX | 新增包，**已实现（S2-01/S2-04/S2-05）**：`db/schema/groups/members` 四个模块，延迟建库、`user_version` 校验、群策略（告知版本、开关、暂停、修订）与成员状态；`bump_revision` 供"清空"与"无行群的暂停"使用；记忆表属 S3，结构与授权列均不存在 |
 | `memory/*` | 候选 → 独立抽取 → 严格解析 → 短事务写回；隔离检索 | 不使用千鹤人设或群历史；不递归触发；不接受模型决定归属 | R-MEM、R-DATA、R-OPS | 新增包 |
 
@@ -209,6 +210,8 @@ scripts/               【新增目录】S0 核验脚本；不属于产品插件
 | K12 | 现有离线测试 audit hook 无条件禁止 `sqlite3.connect` | `tests/test_plugin.py:23-27` | 存储类任务需**有作用域地放宽**（白名单临时库路径），不得删除整体守卫 |
 | K13 | 内置群上下文实现为"宽 filter 的 on_message 采集 + on_llm_request 注入 + after_message_sent 清理" | `astrbot/builtin_stars/astrbot/main.py:196-273`、`.../group_chat_context.py` | 架构 §3.1 要求关闭它；本插件复用其机制形态但不复用其存储 |
 | K14 | **框架侧模型路径的两道门**：①`provider_settings.enable=false` 使 ProcessStage 的第二条默认路径整体关闭，并使 `AgentRequestSubStage.process` 在入口立即返回——**插件经 `event.request_llm` 的请求也走这条路径，因此该键为 `false` 时插件不能使用它**（注意 ProcessStage 的 handler 分支本身不检查该键，短路发生在它委托的子阶段里）；②第二路径的门槛是 `not _has_send_oper ∧ is_at_or_wake_command ∧ not call_llm` 且内层 `(有结果 ∧ ¬已停止) ∨ 无结果`；③`event.request_llm` **没有**重试参数，而 `Provider.text_chat` 有 `request_max_retries` | `process_stage/stage.py:52-67`、`method/agent_request.py:30-33`、`platform/astr_message_event.py:425-479`（request_llm 签名）、`provider/provider.py`（text_chat 签名） | 决定 S1-10 走**直调提供商**（附录 D.2）：插件自己按 `LLMRequestPlan.call_kwargs()` 调用 `Provider.text_chat`，重试次数可按次传入；已由 `scripts/s0/check_single_call.py` 离线钉住 |
+| K15 | **平台消息历史的删除语义与文档相反**：`PlatformMessageHistoryManager.delete(platform_id, user_id, offset_sec=86400)` 删的是"**最近** offset 秒内"的行（`db/sqlite.py:844-862` 的 SQL 是 `created_at >= now - offset`），而 mgr 的 docstring 写的是 "older than"；整体删除的唯一上游惯用法是 `offset_sec=99999999`（dashboard 的删除会话就这么用）。表无按 umo 的批量删除方法，只有 `delete_by_id` | `astrbot/core/platform_message_history_mgr.py:140-148`、`astrbot/core/db/sqlite.py:844-862`、`dashboard/services/chat_service.py:667` | S2-08 的"清空受影响群历史"必须用超大窗口，**不能**依赖默认值；另：QQ 群消息经 `event.send` 不写该表（只有内置群历史开关或 `Context.send_message` 才写），因此这步是幂等防御性清理 |
+
 
 ### 3.5 需显式声明的设计判断
 
@@ -247,7 +250,7 @@ scripts/               【新增目录】S0 核验脚本；不属于产品插件
 | S3 | 3a 存储与授权（S3-01—S3-04）、3b 抽取（S3-05—S3-07）、3c 检索与注入（S3-08）、3d 修订失效（S3-09—S3-11）、3e 回归（S3-12—S3-13） |
 | S4 | 4a 故障与并发（S4-01—S4-02）、4b 隐私/日志/备份（S4-03—S4-04）、4c 人设评审（S4-05）、4d Mac 端到端（S4-06）、4e Linux（S4-07）、4f 终验收（S4-08） |
 
-**2026-09-18**：S2 的 2a（S2-01/S2-02）、2b（S2-03、S2-04）、2d（S2-06、S2-07）与 2c 的前半（S2-05 的维护者命令）的**离线部分**已完成；剩下 2c 的 S2-08（清理覆盖与失败登记）与 2e（S2-09、S2-10），其中 S2-10 阶段门仍不可能通过（见第 9.5 节）。
+**2026-09-18**：S2 的 2a（S2-01/S2-02）、2b（S2-03、S2-04）、2c（S2-05、**S2-08**）与 2d（S2-06、S2-07）的**离线部分**已完成，2e 的 **S2-09**（离线用例 + 附录 E 映射）已完成；只剩 **S2-10 阶段门**——它仍不可能通过（见第 9.5 节），下一批只能"留证 + 标注未通过"。
 
 ## 5. 任务卡
 
@@ -458,6 +461,19 @@ S1-06 原判据含两件不同性质的事，其中一件在 S1 无法完成：
 
 **本批仍不做的**：`帮助` 与记忆类命令（S3-03/S3-04）；暂停时"停抽取"只是写入策略状态（S3 读取），当前没有抽取任务可停；真实群里的告知发布与权限映射（S4-06）。
 
+**S2-08/S2-09 的实施判断（2026-09-18，用户批准两项取舍）**
+
+| 事项 | 决定 | 理由 |
+|---|---|---|
+| 平台消息历史清理（**K15**） | 默认清理路径 = `delete_conversations_by_user_id(umo)` + `message_history_manager.delete(platform_id=umo 首段, user_id=umo, offset_sec=99_999_999)`；两步各自尝试，任一失败即抛出并登记 | 上游默认 86400 的语义是"删最近 24 小时"（docstring 写反），不用超大窗口就**删错方向**。QQ 群消息经 `event.send` 本不写该表，所以这步是幂等防御性清理——部署若曾打开内置群历史开关才真正删到东西 |
+| 启动裁剪 | 新增 `history.trim_stored`：**只移除过期/超轮的 `_at` 成对条目，未识别条目原样保留**；无改动返回 `None`；`initialize()` 里 `await` 一次，**`platform_id` 为空直接跳过** | 同一张会话表可能有框架的 `_checkpoint`、别处写的历史；整体重建会把它们顺手删掉。"只写回真正裁过东西的会话"是第二道保险。空 `platform_id` 会让上游的过滤条件失效（扫全实例会话），必须挡在调用之前 |
+| 启动清理失败 | 只记 `cleanup_failures` 计数 + 审计，**不置 `DELETION_FAILED`** | 过期轮次在读侧本来就不会进入请求（`select` 已过滤），为一次启动抖动停掉整进程采集换不到隐私收益。成员/维护者**主动**删除的失败路径仍按 §8.3 置降级"保持相关能力关闭" |
+| 失败登记（**用户确认**） | **运行时登记**：`HealthMonitor.record_cleanup_failure()`（只增不清）+ `千鹤 状态` 可选行 `清理失败：{n} 次（待维护者复跑清理命令）`（仅 n>0，**新文案待评审**）；不做 schema v2 持久化 | 持久化要动 `storage/schema.py` 与迁移路径，属 S3-01 的范围内；重启后计数归零这一缺口记入 R23，端到端验证归 S4-03 |
+| 在途失效 | 复核四条路径（退出/关闭/清空/暂停）都在同一事务里 `+1` 群修订；本批补"清空/暂停在模型在途时执行"的用例 | "在途结果失效"靠修订比对，不靠取消任务（队列取消只是优化） |
+| 假件边界 | `FakeContext` **只在显式传参时**挂 `conversation_manager`/`message_history_manager`；`FakeHistoryStore.sweep` 默认只记录（不真裁），`apply_sweep=True` 才应用 | 保持"取不到就是取不到"的 fail-closed 姿态，也让既有用例对 `raw` 的断言不被启动裁剪意外改动 |
+
+**本批仍不做的**：记忆类清理（S3）；把失败登记持久化（S3-01/S4-03）；"清理失败"的群内提示文案（属附录 C 待审，维护者只能从状态行与日志看到）。
+
 ### 5.3 S2 群上下文（10 项）
 
 | 任务 | 目标 | 依赖 | 交付物 | R | A | 完成判据 |
@@ -469,8 +485,8 @@ S1-06 原判据含两件不同性质的事，其中一件在 S1 无法完成：
 | S2-05 | 群维护者命令【已完成·离线部分】 | S2-01、S1-06 | `main.py` 命令接线 + `storage/groups.py::bump_revision` | R-ADM、R-CTX | A04、A06 | 权限显式映射；`群上下文 开启` / `群上下文 确认开启` / `群上下文 关闭` 与 `千鹤 暂停` / `千鹤 恢复` 按第 9.1 节 B1a 与需求 §4.4 执行；暂停时停采集、清缓冲、停抽取但**保留成员删除通道**；关闭与清空按架构 §6.3 执行。**2026-09-18**：离线部分成立（`_handle_group_notice`/`_handle_group_control`，含 `上下文 清空`；`_group_state` 已替换为读持久化策略）；"停抽取"仅写入策略状态供 S3 读取；真实权限映射与在线行为属 S4-06 |
 | S2-06 | 上下文装配与临时注入【已完成·离线部分】 | S0-04、S2-03 | `context_assembly.py` | R-CTX、R-CHAT、R-DATA | A05、A12 | 展示短标签与时间，本地稳定 ID → 标签映射；昵称转义与限长，不可冒充 system/assistant/他人；同事件去重；8192 token 上限裁剪，超限先裁最旧或低相关；临时材料标记为临时（K6、K9）。**2026-09-18**：判据离线部分全部成立（`test_context_assembly.py` 43 项、`test_assembly.py` 的 `ContextInjectionTests`）；材料块标题与"当前发言者"行属**模型可见文本待评审**，裁剪/拒绝语义见 §5.2 实施判断 |
 | S2-07 | 群互动历史限制与排除【已完成·离线部分】 | S0-05、S2-01 | `history.py`（新增）+ `main.py` 会话存储适配 | R-CTX、R-DATA | A05、A12 | 20 轮且 24 小时；控制命令不入历史；**记忆辅助整轮不入共享历史**（与 S3-08 联调验证）。**2026-09-18**：前两条与"仅送达写回、写前比对修订"离线成立（`test_history.py` 18 项、`test_assembly.py` 的 `HistoryTests`）；`_at` 私有键承载 TTL，未新增表；`memory_assisted=True` 分支仅有单元测试，**联调归 S3-08** |
-| S2-08 | 清理覆盖与失败登记 | S2-04、S2-05 | 清理路径 + 失败登记 | R-DATA | A06、A19 | 逐项覆盖架构 §6.3；在途结果失效；清理失败**不虚报已删除**，保持相关能力关闭并登记待维护错误 |
-| S2-09 | S2 离线测试 | S2-08 | 用例 | R-CTX、R-DATA | A05、A06、A11、A12、A19 部分 | 假时钟推进 TTL；假提供商验证"未逐条分析"；验证退出后不再出现该成员旧材料 |
+| S2-08 | 清理覆盖与失败登记【已完成·离线部分】 | S2-04、S2-05 | 清理路径（会话历史 + 平台消息历史）+ 启动裁剪 + 失败登记 | R-DATA | A06、A19 | 逐项覆盖架构 §6.3；在途结果失效；清理失败**不虚报已删除**，保持相关能力关闭并登记待维护错误。**2026-09-18**：①清理覆盖——§6.3 七行里可离线落地的五行全部成立（退出/关闭/清空各清会话历史与平台消息历史；重装走"无策略行即关闭"；**正常重启**由启动裁剪补齐）；记忆两行属 S3；②在途失效——四条路径 +1 群修订并有在途丢弃用例；③失败登记——`record_cleanup_failure()` + 状态行可选行 + `DELETION_FAILED` 保持关闭；**登记不跨重启**记入 R23；平台消息历史删除的窗口语义属 O-06 在线核验 |
+| S2-09 | S2 离线测试【已完成·离线部分】 | S2-08 | 用例 + 附录 E 映射 | R-CTX、R-DATA | A05、A06、A11、A12、A19 部分 | 假时钟推进 TTL；假提供商验证"未逐条分析"；验证退出后不再出现该成员旧材料。**2026-09-18**：三条判据对应既有用例（`test_buffer_ttl_follows_the_injected_clock`、`ContextCollectionTests` 的零模型调用、`ContextCommandTests`/`ContextInjectionTests` 的退出清理），本批补三个缺口（跨实例重启、TTL 后材料不入载荷、跨群隔离），映射见**附录 E** |
 | S2-10 | S2 阶段门【授权】 | S2-09 | 门禁记录 | — | — | G03 初验通过；G04 初验通过 |
 
 ### 5.4 S3 授权记忆（13 项）
@@ -631,9 +647,10 @@ S0-01 → S0-02 → S0-03 → S1-01 → S1-02 → S1-03 → S1-14 → S1-15 → 
 | R13 | 私聊默认唤醒（K3）与 ProcessStage 第二条 LLM 路径（K4） | A02/A03 失败：私聊被回复；@ 事件双次调用模型 | S0-02、S1-03、S1-14 | **离线已证实行为**：私聊默认 `at_or_wake=True`；第二条路径门槛是 `is_at_or_wake_command`。S1-14 以 `stop_event() + clear_result() + should_call_llm(True)` 收口并经离线回归（`check_collect.py` 的判据按 K5 同步修正为 `call_llm=True`）。在线待验证 |
 | R14 | 群共享会话下"清空整段群历史"会清掉全群互动历史（K9） | A06/A12 语义偏差，需向成员明确告知 | S0-05、S2-07、S2-08 | **离线已证实**：`unique_session=false` 时 umo 只含群号，按 umo 删除即整群；原生无成员级删除。S2-04 的退出清理已按此实现（按 umo 删除整群会话）；S2-07 的写回与清空之间是"收窄而非原子"的窗口（发送前/写回前两次修订比对），真实删除效果仍在线待验证（O-06） |
 | R15 | 保留内置插件 `astrbot.builtin_stars.astrbot.main` **不受 `disable_builtin_commands` 约束**，其 `handle_empty_mention` 优先级高于本插件且会 `stop_event()`，使本插件根本不被执行 | A03 失败：空 @ 会被回复并向模型发起请求 | S0-02、S1-16 | **离线已证实**：唯一关闭手段是 `platform_settings.empty_mention_waiting`（含 `_need_reply`）。在线待验证 |
-| R16 | 框架对会话与平台消息历史**没有原生 TTL**；`agent_runner…compression.max_turns` 默认 `-1`（不限） | R-CTX 的 20 轮/24 小时与 R-MEM 的 90 天全部需要插件自建清理 | S2-07、S2-08、S3-02 | **离线已证实**。S2-03 的内存缓冲 TTL 已实现（30 条/10 分钟取严、惰性淘汰）；**S2-07 已实现**会话历史的 20 轮/24 小时（写入与读取两侧执行，时间戳走 `_at` 私有键）；平台消息历史的清理仍属 S2-08，90 天属 S3-02 |
+| R16 | 框架对会话与平台消息历史**没有原生 TTL**；`agent_runner…compression.max_turns` 默认 `-1`（不限） | R-CTX 的 20 轮/24 小时与 R-MEM 的 90 天全部需要插件自建清理 | S2-07、S2-08、S3-02 | **离线已证实**。S2-03 的内存缓冲 TTL（30 条/10 分钟取严）、**S2-07 会话历史 20 轮/24 小时**（读写两侧执行、时间戳走 `_at`）与 **S2-08 的启动裁剪**均已实现；平台消息历史本身无写入路径（K15），清理用超大窗口做幂等防御；90 天属 S3-02 |
 | R21 | **存储路径解析失败会静默降级为"无存储"**：`StarTools.get_data_dir()` 依赖 `star_map` 的插件名，解析失败或库损坏时 S2 采集与退出/加入全部关闭，插件仍正常聊天，只有 `千鹤 状态` 的降级行可见 | 维护者可能误以为"采集已开启"却毫无数据；成员以为已退出但状态未持久化（实际上退出路径在无存储时**不落状态也不虚报**，仍 fail-closed） | S2-01、S2-02、S4-06 | **离线已证实**（机制）：降级为 `MEMORY_STORE_FAILED`，写路径全部拒绝并留 `CONTEXT_OP` 审计；S2-02/S2-05 补上：`群上下文 开启` 仍能回复告知全文（不需要存储），但确认与暂停/关闭/清空**不生效**（清空仍清内存与会话历史），暂停状态读取失败按"未暂停"放行；S2-06/S2-07 的聊天与历史同样不受影响。在线待验证路径解析在真实 `star_manager` 装载下成立 |
 | R22 | **部署配置的 `notice_version` 与插件内告知文案版本不一致时**，`群上下文 开启`/`确认开启` 一律拒绝且**群内静默**（只有审计 `CONTEXT_OP/REQUEST_INVALID`） | 维护者改了配置版本（或改了文案忘记同步）后，机器人对「群上下文 开启」毫无反应，看起来像"坏了"；若改成"写入部署版本"则会出现"告知内容与记录版本不符"的隐私问题 | S2-02、S4-01 | **离线已证实**（机制）：拒绝路径有测试钉住（`test_version_mismatch_is_silent_and_never_opens`），且 `Settings()` 默认值与 `notice.NOTICE_VERSION` 一致。**这是刻意的 fail-closed 取舍**：不一致时的正确做法是回设计评审（改文案必须同时递增两个版本），而不是猜哪个为准。拒绝文案属附录 C 待审范围，在线可见性（是否需要维护者可读的提示）交 S4-01/S4-04 |
+| R23 | **删除失败登记不跨重启**：`cleanup_failures` 与 `DELETION_FAILED` 都在内存里，重启后归零；失败过一次的清理在重启后不再被提醒（成员退出/暂停的**持久状态**不受影响） | 维护者可能误判"已经恢复"，实际上旧历史仍在会话存储里；平台消息历史的"整体删除"窗口（`offset_sec=99999999`）也只有离线推断，真实删除效果未在线核验 | S2-08、S3-01、S4-03 | **已知限制（用户 2026-09-18 确认的取舍）**：本批只做运行时登记；持久化登记需要 schema 迁移（属 S3-01）与删除端到端验证（属 S4-03）。恢复手段已经存在：维护者重新执行 `上下文 清空` 或 `群上下文 关闭` 即会再次尝试清理 |
 | R17 | `Platform.status` 只反映适配器任务生命周期，**不含 QQ 登录态与连接质量**；`get_stats()['last_error']['traceback']` 是自由文本，`Platform.config` 含 `ws_reverse_token` | 误把"适配器在跑"当成"账号在线"，G01/A01 的判断失真；直接取用错误详情会把堆栈或凭据带进日志 | S1-04、S4-06 | **离线已证实**（源码）：`health.py` 只映射四个既有状态、只计 `len(errors)`，报告固定输出"账号在线性：未知"；在线待验证 |
 | R18 | 上游日志**不做任何脱敏**：`astrbot/core/log.py` 原样转发格式化文本到文件与 WebUI 缓存（`deque(maxlen=500)`）；轮转 `backup_count` 硬编码为 3，保留天数无配置键 | G07/A19 失败：正文或密钥经框架日志落盘，且插件无法用配置收紧 | S1-13、S4-04 | **离线已证实**（源码）：`redact.py` 已把插件侧记录收敛为结构化字段并给出 `AUDIT_CHECKLIST`；框架侧只能审计，在线待验证 |
 | R19 | **重试层数叠加**：插件按次传入的 `request_max_retries` 只覆盖 `request_retry.py` 的 `stop_after_attempt`；OpenAI 适配器另有外层 `max_retries = 10` 循环，`AsyncOpenAI` 未设 `max_retries` 因而沿用 SDK 默认 2 | G06/A16 判断失真：一次 @ 的真实请求数可能远大于"1 次 + 1 次重试"，成本与 429 退避都会偏离预期 | S1-10、S4-02 | **离线已证实**（层数与参数位置；`check_single_call.py` 钉住 `request_max_retries`/`func_tool` 等签名）；**实际总次数只能在线验证** |
@@ -726,6 +743,8 @@ S0-01 → S0-02 → S0-03 → S1-01 → S1-02 → S1-03 → S1-14 → S1-15 → 
 **第二批（2d）的边界**：S2-06/S2-07 的判据只有**离线部分**成立；A05/A12 的真实传输、真实 DeepSeek 对材料与历史的处理、20 轮/24 小时在真实会话存储中的表现，全部归 S4-06；`memory_assisted=True` 的整轮排除要等 S3-08 才能联调。
 
 **第三批（2a 剩余 + 2c 前半）的边界**：S2-02/S2-05 的判据只有**离线部分**成立——真实群里的告知发布、权限映射、暂停/关闭的实际效果、`上下文 退出` 在真实会话存储上的删除效果，全部归 S4-06；"停抽取"只是写入策略状态（S3 读取）；告知文案版本与配置不一致时的**静默拒绝**是刻意取舍（R22），其可观测性交 S4-01/S4-04。**生产环境采集仍默认关闭**：需要维护者在运行时配置里填入允许群与维护者，并实际完成一次两步开启。
+
+**第四批（2c 剩余 + 2e 前半：S2-08 + S2-09）的边界**：清理覆盖里"平台消息历史"的真实删除效果（K15 的超大窗口语义、`created_at` 与 cutoff 的时区差）只有**离线推断**，归 O-06/S4-03 的在线核验；失败登记不跨重启（R23）；启动裁剪只处理本平台的会话，且只动带 `_at` 的成对条目。S2-09 的附录 E 是**离线用例映射**，不替代 S4-06 的真实环境验收。
 
 ## 10. 变更控制与维护
 
@@ -1061,3 +1080,56 @@ DeepSeek 处理，而且已经发出的群消息其他成员都能看到，无�
 | O-09 | 无隐式 pip | 完整启动实例，观察安装与启动日志 | 无 pip/pip3/python -m pip 调用 |
 | O-10 | NapCat/QQ/Mac 组合 | 建立鉴权 OneBot 连接 | 连接可用；断线与离线可观察 |
 
+
+## 附录 E：S2 离线判据 × 用例映射（S2-09 交付物）
+
+**用途**：把 A05/A06/A11/A12/A19 的**离线可验证部分**与具体用例对上，便于复核与回归。
+**这不是验收记录**：真实传输、真实会话存储、真实群行为仍归 S4-06（在线），本节只说明"离线能证到哪一步"。
+用例默认位于 `tests/test_assembly.py`；其他模块另行标注。
+
+### A05 普通群聊后有人 @ 询问同一话题
+
+| 判据要点 | 用例 | 离线证据 |
+|---|---|---|
+| 窗口内必要内容可用 | `test_buffer_material_reaches_request_as_temp_part` | 材料经 `extra_user_content_parts` 进入请求，带短标签与时间 |
+| 窗口外内容不入请求 | `test_buffer_ttl_follows_the_injected_clock`、`RestartAndIsolationTests.test_expired_material_never_reaches_the_request` | 假时钟推进 TTL 后条目淘汰，载荷里既无材料也无旧文本 |
+| 不逐条自动分析 | `ContextCollectionTests.test_open_group_collects_plain_text`、`ZeroOutboundTests.test_non_trigger_shapes_produce_no_output` | 采集支路零模型调用、零出站 |
+| 历史窗口同样受 TTL 约束 | `HistoryTests.test_expired_history_is_not_injected`、`test_history_is_capped_at_configured_turns`、`tests/test_history.py::SelectTests` | 20 轮/24 小时取严，过期轮次不进 `contexts` |
+| 同事件不重复出现 | `test_same_event_is_never_repeated_as_material`；`tests/test_history.py::TrimStoredTests` | 按 message_id 排除；裁剪只动 `_at` 成对条目 |
+
+### A06 未告知、成员退出、群上下文关闭
+
+| 判据要点 | 用例 | 离线证据 |
+|---|---|---|
+| 未告知不采集 | `ContextCollectionTests.test_collection_stays_off_without_storage`、`MaintainerCommandTests.test_open_replies_with_the_approved_notice_and_keeps_collection_closed` | 无策略行即关闭；`群上下文 开启` 只回文案不开采集 |
+| 告知两步才开启且不补采 | `test_confirm_opens_collection_and_never_backfills`、`test_expired_confirmation_resends_the_notice_and_can_be_retried`、`test_other_maintainer_must_restart_the_flow` | 确认前消息不入缓冲；窗口取严、换人作废 |
+| 成员退出即停采并清材料 | `ContextCommandTests.test_leave_persists_clears_buffer_and_history`、`ContextInjectionTests.test_member_who_left_contributes_no_material` | 退出持久化 + 清本人缓冲 + 清受影响历史；退出后材料为空 |
+| 退出后仍可聊天 | `test_leave_then_addressed_chat_still_works` | 当前 @ 不依赖采集状态 |
+| 暂停/关闭即清 | `test_pause_blocks_chat_clears_buffer_and_resume_restores`、`test_close_stops_collection_and_clears_buffer_and_history` | 缓冲清空、采集停、聊天按暂停语义 |
+| 清理失败不虚报 | `test_history_failure_is_reported_without_faking_deletion`、`CleanupCoverageTests.test_platform_history_failure_is_registered_not_hidden`、`test_status_reports_cleanup_failures` | 置 `DELETION_FAILED` + 计数 + 状态行；不宣称已删除 |
+| 关闭/清空覆盖到平台消息历史 | `CleanupCoverageTests.test_leave_clears_conversation_and_platform_history`、`test_close_and_clear_also_clean_platform_history` | 两步清理都被调用（K15 的超大窗口） |
+
+### A11 同一账号在两群、不同成员同昵称、昵称修改
+
+| 判据要点 | 用例 | 离线证据 |
+|---|---|---|
+| 群边界隔离 | `RestartAndIsolationTests.test_groups_do_not_leak_into_each_other`；`tests/test_storage_members.py` | 材料与缓冲不互串；成员状态按（群, 成员）隔离 |
+| 昵称不决定身份 | `tests/test_plugin.py::PluginTests.test_nickname_does_not_control_identity`、`tests/test_context_assembly.py::LabelMapTests`、`RenderMaterialsTests.test_labels_are_stable_and_independent_of_nicknames` | 标签由稳定 ID 决定；同名不同人分属不同标签 |
+| 昵称不可伪装 | `test_nickname_cannot_impersonate_roles_or_lines`；`tests/test_context_assembly.py::EscapeNicknameTests` | 折行、去角色冒号、限长 |
+
+### A12 A 的记忆辅助回复后 B 再 @（S2 部分）
+
+| 判据要点 | 用例 | 离线证据 |
+|---|---|---|
+| 控制命令与临时材料不入共享历史 | `HistoryTests.test_control_commands_are_never_written_back`、`CleanupCoverageTests`（清空/关闭） | 只有聊天路径写回，且只写纯文本问答 |
+| 退出成员的材料不再出现 | `test_member_who_left_contributes_no_material`、`RevisionGateTests.test_midflight_leave_drops_the_inflight_reply` | 修订复核丢弃在途结果 |
+| 记忆注入的隔离（**仅结构位**） | `tests/test_history.py::ShouldRecordTests`（`memory_assisted=True` 不写回） | 长期记忆属 S3，整轮排除的**联调**归 S3-08 |
+
+### A19 删除后重启、恢复脱敏配置、查看日志及端口（S2 部分）
+
+| 判据要点 | 用例 | 离线证据 |
+|---|---|---|
+| 删除/退出后重启不复活 | `RestartAndIsolationTests.test_restart_keeps_persistent_state_and_drops_ephemeral` | 同一 `storage_path` 建第二个实例：退出/暂停状态保留、缓冲与待确认窗口为空 |
+| 重启时清理过期历史 | `CleanupCoverageTests.test_startup_sweep_trims_expired_turns`、`test_startup_sweep_uses_the_real_adapter`、`test_startup_sweep_skips_without_platform_id` | 只裁 `_at` 成对条目；框架条目零写回；空 `platform_id` 不扫全实例 |
+| 日志不含正文与密钥 | `tests/test_redact.py`（35 项）、`test_redact.py` 的清单为子集断言 | 结构上写不进正文；真实日志与端口审计归 S4-04 |
+| 失败登记可见、但不跨重启 | `test_status_reports_cleanup_failures`；`tests/test_health.py::ReportTests` | 状态行可选行；**R23** 记录"重启后归零"这一限制 |

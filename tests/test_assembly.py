@@ -144,12 +144,16 @@ class AssemblyTestCase(unittest.IsolatedAsyncioTestCase):
         storage_path=None,
         history_cleaner=None,
         history_store=None,
+        conversation_manager=None,
+        message_history_manager=None,
     ):
         self.context = fakes.FakeContext(
             provider=provider,
             platform=platform,
             provider_error=provider_error,
             platform_error=platform_error,
+            conversation_manager=conversation_manager,
+            message_history_manager=message_history_manager,
         )
         self.plugin = fakes.make_plugin(self.context, config or make_config(), clock=self.clock)
         if storage_path is not None:
@@ -1334,6 +1338,261 @@ class MaintainerCommandTests(AssemblyTestCase):
         await self.plugin.on_message(self.mention("群上下文 关闭", message_id="close-1"))
         await self.plugin.on_message(self.mention("千鹤 状态", message_id="status-2"))
         self.assertIn("群上下文：已关闭（notice-1）", text_of(self.sent[0]))
+
+
+class CleanupCoverageTests(AssemblyTestCase):
+    """S2-08：清理覆盖（会话历史 + 平台消息历史）与失败登记。"""
+
+    def umo(self, group_id: str = "20001"):
+        return f"qq-local:GroupMessage:{group_id}"
+
+    async def start_with_managers(self, *, provider=None, history_store=None, config=None):
+        self.conversations = fakes.FakeConversationManager()
+        self.message_history = fakes.FakeMessageHistoryManager()
+        await self.start(
+            provider=provider or fakes.FakeProvider(),
+            storage_path=self.new_storage_path(),
+            history_store=history_store if history_store is not None else fakes.FakeHistoryStore(),
+            conversation_manager=self.conversations,
+            message_history_manager=self.message_history,
+            config=config,
+        )
+
+    async def test_leave_clears_conversation_and_platform_history(self):
+        await self.start_with_managers()
+        self.open_group()
+        await self.plugin.on_message(self.plain("退出前的话"))
+        await self.plugin.on_message(self.mention("上下文 退出", message_id="leave-1"))
+
+        self.assertEqual(self.conversations.deleted, [self.umo()])
+        self.assertEqual(
+            self.message_history.calls,
+            [("qq-local", self.umo(), plugin_module.DELETE_ALL_HISTORY_SECONDS)],
+        )
+        self.assertEqual(self.plugin.services.health.cleanup_failures(), 0)
+
+    async def test_close_and_clear_also_clean_platform_history(self):
+        await self.start_with_managers()
+        self.open_group()
+        await self.plugin.on_message(self.mention("群上下文 关闭", message_id="close-1"))
+        await self.plugin.on_message(self.mention("上下文 清空", message_id="clear-1"))
+        self.assertEqual(len(self.conversations.deleted), 2)
+        self.assertEqual(len(self.message_history.calls), 2)
+        for platform_id, umo, offset in self.message_history.calls:
+            with self.subTest(umo=umo):
+                self.assertEqual(platform_id, "qq-local")
+                self.assertEqual(umo, self.umo())
+                self.assertEqual(offset, plugin_module.DELETE_ALL_HISTORY_SECONDS)
+
+    async def test_platform_history_failure_is_registered_not_hidden(self):
+        self.conversations = fakes.FakeConversationManager()
+        self.message_history = fakes.FakeMessageHistoryManager(error=RuntimeError("delete failed"))
+        await self.start(
+            provider=fakes.FakeProvider(),
+            storage_path=self.new_storage_path(),
+            history_store=fakes.FakeHistoryStore(),
+            conversation_manager=self.conversations,
+            message_history_manager=self.message_history,
+        )
+        self.open_group()
+        await self.plugin.on_message(self.mention("上下文 清空", message_id="clear-1"))
+
+        # 第一步仍然执行（两步各自尝试），失败被登记而不是被吞掉。
+        self.assertEqual(self.conversations.deleted, [self.umo()])
+        self.assertEqual(self.plugin.services.health.cleanup_failures(), 1)
+        self.assertIn(
+            plugin_module.health.Degradation.DELETION_FAILED,
+            self.plugin.services.health.degradations(),
+        )
+        self.assertEqual(self.sent, [])
+
+    async def test_status_reports_cleanup_failures(self):
+        self.conversations = fakes.FakeConversationManager()
+        self.message_history = fakes.FakeMessageHistoryManager(error=RuntimeError("delete failed"))
+        await self.start(
+            provider=fakes.FakeProvider(),
+            storage_path=self.new_storage_path(),
+            history_store=fakes.FakeHistoryStore(),
+            conversation_manager=self.conversations,
+            message_history_manager=self.message_history,
+        )
+        self.open_group()
+        await self.plugin.on_message(self.mention("上下文 清空", message_id="clear-1"))
+        await self.plugin.on_message(self.mention("千鹤 状态", message_id="status-1"))
+        self.assertIn("清理失败：1 次", text_of(self.sent[0]))
+
+    async def test_startup_sweep_trims_expired_turns(self):
+        now = int(self.clock.now().timestamp())
+        raw = stored_history(
+            [("过期问", "过期答", now - 25 * 3600), ("新鲜问", "新鲜答", now - 60)]
+        )
+        store = fakes.FakeHistoryStore(raw=raw, apply_sweep=True)
+        await self.start_with_managers(history_store=store)
+
+        self.assertEqual(store.sweeps, ["qq-local"])
+        contents = [entry["content"] for entry in json.loads(store.raw or "[]")]
+        self.assertEqual(contents, ["新鲜问", "新鲜答"])
+
+    async def test_startup_sweep_uses_the_real_adapter(self):
+        now = int(self.clock.now().timestamp())
+        conversations = fakes.FakeConversationManager(
+            conversations=[
+                (
+                    "qq-local:GroupMessage:20001",
+                    "cid-1",
+                    stored_history([("过期问", "过期答", now - 25 * 3600), ("新鲜问", "新鲜答", now - 60)]),
+                ),
+                # 只有框架自己的条目：一个轮次都识别不出来 ⇒ 不得写回（避免误删）。
+                ("qq-local:GroupMessage:20002", "cid-2", json.dumps([{"role": "_checkpoint", "content": {}}])),
+            ]
+        )
+        self.conversations = conversations
+        self.message_history = fakes.FakeMessageHistoryManager()
+        await self.start(
+            provider=fakes.FakeProvider(),
+            storage_path=self.new_storage_path(),
+            conversation_manager=conversations,
+            message_history_manager=self.message_history,
+        )
+
+        self.assertEqual(conversations.listed_platforms, ["qq-local"])
+        self.assertEqual(len(conversations.updates), 1)
+        umo, cid, entries = conversations.updates[0]
+        self.assertEqual((umo, cid), ("qq-local:GroupMessage:20001", "cid-1"))
+        self.assertEqual([entry["content"] for entry in entries], ["新鲜问", "新鲜答"])
+        self.assertEqual(self.plugin.services.health.cleanup_failures(), 0)
+
+    async def test_startup_sweep_skips_without_platform_id(self):
+        store = fakes.FakeHistoryStore(raw="[]", apply_sweep=True)
+        await self.start(
+            provider=fakes.FakeProvider(),
+            config=make_config(platform_id=""),
+            history_store=store,
+        )
+        self.assertEqual(store.sweeps, [])
+
+    async def test_startup_sweep_without_framework_interface_is_not_a_failure(self):
+        # 没有会话接口就没有可清的东西：跳过而不是记一次失败。
+        await self.start(provider=fakes.FakeProvider(), storage_path=self.new_storage_path())
+        self.assertEqual(self.plugin.services.health.cleanup_failures(), 0)
+
+    async def test_startup_sweep_failure_is_registered_without_halting_collection(self):
+        store = fakes.FakeHistoryStore(sweep_error=RuntimeError("list failed"))
+        await self.start_with_managers(history_store=store)
+        self.assertEqual(self.plugin.services.health.cleanup_failures(), 1)
+        self.assertNotIn(
+            plugin_module.health.Degradation.DELETION_FAILED,
+            self.plugin.services.health.degradations(),
+        )
+        # 启动抖动不停采集：告知后普通消息照常入库。
+        self.open_group()
+        await self.plugin.on_message(self.plain("照常采集"))
+        self.assertEqual(len(self.collected()), 1)
+
+    async def test_clear_invalidates_inflight_reply(self):
+        def clear_group():
+            self.plugin.services.storage.groups.bump_revision(self.group_key())
+
+        provider = MutatingProvider(action=clear_group)
+        await self.start(provider=provider, storage_path=self.new_storage_path(), history_store=fakes.FakeHistoryStore())
+        self.open_group()
+        await self.plugin.on_message(self.mention("你好", message_id="chat-1"))
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(self.sent, [])
+
+    async def test_pause_invalidates_inflight_reply(self):
+        def pause_group():
+            self.plugin.services.storage.groups.set_paused(self.group_key(), paused=True)
+
+        provider = MutatingProvider(action=pause_group)
+        await self.start(provider=provider, storage_path=self.new_storage_path(), history_store=fakes.FakeHistoryStore())
+        self.open_group()
+        await self.plugin.on_message(self.mention("你好", message_id="chat-1"))
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(self.sent, [])
+
+
+class RestartAndIsolationTests(AssemblyTestCase):
+    """S2-09：跨实例重启、TTL 后材料不入载荷、跨群隔离。"""
+
+    async def start_with_storage(self, *, provider=None, config=None, history_store=None):
+        await self.start(
+            provider=provider or fakes.FakeProvider(),
+            storage_path=self.storage_path,
+            history_cleaner=fakes.FakeHistoryCleaner(),
+            history_store=history_store if history_store is not None else fakes.FakeHistoryStore(),
+            config=config,
+        )
+
+    async def test_restart_keeps_persistent_state_and_drops_ephemeral(self):
+        self.storage_path = self.new_storage_path()
+        store = fakes.FakeHistoryStore(raw="[]", apply_sweep=True)
+        await self.start_with_storage(history_store=store)
+        self.open_group()
+        await self.plugin.on_message(self.plain("退出前的话"))
+        await self.plugin.on_message(self.mention("上下文 退出", message_id="leave-1"))
+        await self.plugin.on_message(self.mention("千鹤 暂停", message_id="pause-1"))
+        self.assertEqual(len(self.collected()), 0)
+
+        # 模拟重启：旧实例终止，用**同一 storage 路径**建新实例。
+        await self.plugin.terminate()
+        await self.start_with_storage(history_store=store)
+        # 每次启动都做一次清理（两次 initialize ⇒ 两条记录）。
+        self.assertEqual(store.sweeps, ["qq-local", "qq-local"])
+
+        policy = self.plugin.services.storage.groups.policy(self.group_key())
+        self.assertTrue(policy.paused)
+        member = plugin_module.MemberKey(self.group_key(), "30001")
+        self.assertTrue(self.plugin.services.storage.members.state(member).opted_out)
+        # 内存态全部重置：缓冲为空、待确认窗口为空。
+        self.assertEqual(self.collected(), ())
+        self.assertIsNone(self.plugin.services.notice.pending(self.group_key()))
+
+    async def test_expired_material_never_reaches_the_request(self):
+        provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="嗯。")])
+        self.storage_path = self.new_storage_path()
+        await self.start_with_storage(provider=provider)
+        self.open_group()
+        await self.plugin.on_message(self.plain("十分钟前说的话"))
+        self.assertEqual(len(self.collected()), 1)
+
+        self.clock.advance(600)  # 缓冲 TTL 取严：恰好到期即过期
+        await self.plugin.on_message(self.mention("你好", message_id="chat-1"))
+
+        self.assertEqual(self.collected(), ())
+        kwargs = provider.calls[0]
+        self.assertEqual(list(kwargs["extra_user_content_parts"]), [])
+        self.assertNotIn("十分钟前说的话", kwargs["prompt"])
+        self.assertNotIn("十分钟前说的话", kwargs["system_prompt"])
+        self.assertEqual(kwargs["contexts"], [])
+
+    async def test_groups_do_not_leak_into_each_other(self):
+        provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="嗯。")])
+        self.storage_path = self.new_storage_path()
+        config = make_config(allowed_group_ids=["20001", "20002"])
+        await self.start_with_storage(provider=provider, config=config)
+        self.open_group(group_id="20001")
+        self.open_group(group_id="20002")
+
+        await self.plugin.on_message(self.plain("甲群的话", group_id="20001", message_id="a1"))
+        await self.plugin.on_message(self.plain("乙群的话", group_id="20002", message_id="b1"))
+        await self.plugin.on_message(self.mention("你好", group_id="20002", message_id="chat-1"))
+
+        material = "".join(part.text for part in provider.calls[0]["extra_user_content_parts"])
+        self.assertIn("乙群的话", material)
+        self.assertNotIn("甲群的话", material)
+
+        # 甲群退出不影响乙群采集（成员状态按群隔离）。
+        await self.plugin.on_message(self.mention("上下文 退出", group_id="20001", message_id="leave-1"))
+        await self.plugin.on_message(self.plain("乙群再说一句", group_id="20002", message_id="b2"))
+        self.assertEqual(
+            [entry.text for entry in self.collected("20002")],
+            ["乙群的话", "乙群再说一句"],
+        )
+        self.assertEqual(
+            [entry.text for entry in self.collected("20001")],
+            [],
+        )
 
 
 if __name__ == "__main__":

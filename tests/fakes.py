@@ -179,7 +179,11 @@ class FakePlatform:
 
 
 class FakeContext:
-    """只实现装配层会用的两个读取入口；其余属性一律不存在（fail-closed）。"""
+    """只实现装配层会用的读取入口；其余属性一律不存在（fail-closed）。
+
+    会话/平台消息管理器**只在显式传入时**挂上——默认仍然取不到，装配层必须像对待
+    真实缺装配的框架一样降级跳过（`tests/test_plugin.py` 的 `Mock(spec=[])` 同例）。
+    """
 
     def __init__(
         self,
@@ -188,6 +192,8 @@ class FakeContext:
         provider_error: BaseException | None = None,
         platform: object = None,
         platform_error: BaseException | None = None,
+        conversation_manager: object = None,
+        message_history_manager: object = None,
     ) -> None:
         self._provider = provider
         self._provider_error = provider_error
@@ -195,6 +201,10 @@ class FakeContext:
         self._platform_error = platform_error
         self.provider_calls: list[object] = []
         self.platform_queries: list[str] = []
+        if conversation_manager is not None:
+            self.conversation_manager = conversation_manager
+        if message_history_manager is not None:
+            self.message_history_manager = message_history_manager
 
     async def get_using_provider_async(self, umo: object = None) -> object:
         self.provider_calls.append(umo)
@@ -207,6 +217,99 @@ class FakeContext:
         if self._platform_error is not None:
             raise self._platform_error
         return self._platform
+
+
+class FakeConversation:
+    """`ConversationManager.get_conversations` 返回的会话对象（只含装配层读的字段）。"""
+
+    def __init__(self, *, umo: str, cid: str, raw: str | None) -> None:
+        self.user_id = umo
+        self.cid = cid
+        self.history = raw
+
+
+class FakeConversationManager:
+    """替换框架会话存储（S2-07/S2-08）：内存里的 (umo, cid, 原文) 列表 + 调用记录。
+
+    `conversations` 传 `(umo, cid, raw)` 三元组序列；`delete_error` / `update_error` /
+    `list_error` 用于注入失败，验证"失败不虚报、登记计数"。
+    """
+
+    def __init__(
+        self,
+        *,
+        conversations: object = (),
+        delete_error: BaseException | None = None,
+        update_error: BaseException | None = None,
+        list_error: BaseException | None = None,
+    ) -> None:
+        self.conversations = [
+            FakeConversation(umo=umo, cid=cid, raw=raw) for umo, cid, raw in conversations
+        ]
+        self.deleted: list[str] = []
+        self.updates: list[tuple[str, str, tuple]] = []
+        self.listed_platforms: list[object] = []
+        self.delete_error = delete_error
+        self.update_error = update_error
+        self.list_error = list_error
+
+    async def delete_conversations_by_user_id(self, umo: str) -> None:
+        self.deleted.append(umo)
+        if self.delete_error is not None:
+            raise self.delete_error
+        self.conversations = [item for item in self.conversations if item.user_id != umo]
+
+    async def get_conversations(self, unified_msg_origin: object = None, platform_id: object = None):
+        self.listed_platforms.append(platform_id)
+        if self.list_error is not None:
+            raise self.list_error
+        return list(self.conversations)
+
+    async def update_conversation(
+        self,
+        unified_msg_origin: str,
+        conversation_id: str | None = None,
+        history: object = None,
+        **kwargs: object,
+    ) -> None:
+        self.updates.append((unified_msg_origin, conversation_id or "", tuple(history or ())))
+        if self.update_error is not None:
+            raise self.update_error
+        for item in self.conversations:
+            if item.cid == conversation_id:
+                import json
+
+                item.history = json.dumps(list(history or ()))
+
+    async def get_curr_conversation_id(self, umo: str) -> str | None:
+        for item in self.conversations:
+            if item.user_id == umo:
+                return item.cid
+        return None
+
+    async def get_conversation(self, umo: str, conversation_id: str, create_if_not_exists: bool = False):
+        for item in self.conversations:
+            if item.cid == conversation_id:
+                return item
+        return None
+
+    async def new_conversation(self, unified_msg_origin: str, **kwargs: object) -> str:
+        cid = f"cid-{len(self.conversations) + 1}"
+        self.conversations.append(FakeConversation(umo=unified_msg_origin, cid=cid, raw="[]"))
+        return cid
+
+
+class FakeMessageHistoryManager:
+    """替换平台消息历史管理器（S2-08）：记录 `(platform_id, user_id, offset_sec)`。"""
+
+    def __init__(self, *, error: BaseException | None = None) -> None:
+        self.calls: list[tuple[str, str, object]] = []
+        self.error = error
+
+    async def delete(self, *, platform_id: str, user_id: str, offset_sec: object = None) -> None:
+        self.calls.append((platform_id, user_id, offset_sec))
+        if self.error is not None:
+            raise self.error
 
 
 class FakeHistoryCleaner:
@@ -227,19 +330,31 @@ class FakeHistoryCleaner:
 
 
 class FakeHistoryStore:
-    """替换插件的互动历史存储（S2-07）：内存原文，可注入读写异常。
+    """替换插件的互动历史存储（S2-07/S2-08）：内存原文，可注入读写异常。
 
     真实实现走 `context.conversation_manager` 的会话接口；离线环境里那会触真框架库，
     装配级测试一律注入本替身。`load` 返回会话存储里的 JSON 原文（`None` = 无会话），
-    `save` 记录写回的条列表。
+    `save` 记录写回的条列表，`sweep` 记录启动裁剪的平台实例（`apply_sweep=True` 时才
+    真的对 `raw` 应用 `trim`）。
     """
 
-    def __init__(self, *, raw: str | None = None, load_error: BaseException | None = None, save_error: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        raw: str | None = None,
+        load_error: BaseException | None = None,
+        save_error: BaseException | None = None,
+        sweep_error: BaseException | None = None,
+        apply_sweep: bool = False,
+    ) -> None:
         self.raw = raw
         self.load_calls: list[str] = []
         self.saves: list[tuple[str, tuple[dict, ...]]] = []
+        self.sweeps: list[str] = []
         self.load_error = load_error
         self.save_error = save_error
+        self.sweep_error = sweep_error
+        self.apply_sweep = apply_sweep
 
     async def load(self, umo: str) -> str | None:
         self.load_calls.append(umo)
@@ -254,6 +369,21 @@ class FakeHistoryStore:
         import json
 
         self.raw = json.dumps(list(entries))
+
+    async def sweep(self, platform_id: str, trim: object) -> tuple[int, int]:
+        """默认只记录（返回 (0, 0)），保护既有用例对 `raw` 的断言。"""
+        self.sweeps.append(platform_id)
+        if self.sweep_error is not None:
+            raise self.sweep_error
+        if not self.apply_sweep:
+            return (0, 0)
+        trimmed = trim(self.raw)
+        if trimmed is None:
+            return (0, 0)
+        import json
+
+        self.raw = json.dumps(list(trimmed))
+        return (1, 0)
 
 
 def make_config(path: Path, **values: object) -> object:

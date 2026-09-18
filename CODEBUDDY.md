@@ -12,11 +12,11 @@ This file provides guidance to CodeBuddy Code when working with code in this rep
 **当前状态：未上线。** S0 离线核验完成，但 **S0 阶段门于 2026-09-17 被维护者决定有意跳过（不是通过）**，
 在线部分（真实 QQ/NapCat/DeepSeek）从未验证。S1 进行中：`S1-01`—`S1-15` 的**离线部分**均已完成
 （含 `main.py` 装配与离线回归），`S1-16` 阶段门与 `S1-10` 的在线部分仍【阻塞·在线/凭据】。
-**S2 于 2026-09-18 离线先行**（docs/03 §9.5）：`S2-01`—`S2-07` 的**离线部分**均已完成
+**S2 于 2026-09-18 离线先行**（docs/03 §9.5）：`S2-01`—`S2-09` 的**离线部分**均已完成
 （`storage/`、`context_buffer.py`、`context_assembly.py` 动态材料、`history.py`、`notice.py`
-告知两步开启与维护者命令、`main.py` 接线）；**`S2-02`/`S2-05` 的前置已由维护者确认**
+告知两步开启与维护者命令、清理覆盖与启动裁剪、`main.py` 接线）；**`S2-02`/`S2-05` 的前置已由维护者确认**
 （2026-09-18：维护者清单与目标群已定，值只进运行时配置；附录 C.1 告知文案定稿），
-`S2-08`/`S2-09` 待做，`S2-10` 阶段门仍不可能通过；S3、S4 未开始。
+只剩 `S2-10` 阶段门，而它**仍不可能通过**（S1 门未过、无在线证据）；S3、S4 未开始。
 **生产环境采集默认关闭**：需维护者在运行时配置里填入允许群与维护者并完成一次两步开启。
 
 | 文档 | 角色 |
@@ -35,7 +35,7 @@ export ASTRBOT_BUILD_DASHBOARD=0   # 阻止上游构建钩子运行 npm
 ```
 
 ```sh
-# 全量离线核验：7 个核验脚本 + 全部单元测试（当前共 522 项单元测试）
+# 全量离线核验：7 个核验脚本 + 全部单元测试（当前共 545 项单元测试）
 bash scripts/s0/run_all.sh
 
 # 只跑全部单元测试
@@ -113,7 +113,7 @@ OneBot 事件 → main.py（唯一框架入口、薄适配，提取 MessageFacts
 | `config.py` | fail-closed 配置模型：任一字段缺失或畸形 → 整体退回哨兵 `Settings()`（拒绝全部） | 不默认开启采集/记忆；密钥不进 `repr` |
 | `policy.py` | 纯触发形态分类：`IGNORE` / `EMPTY_OR_UNSUPPORTED` / `UNSUPPORTED_ATTACHMENT` / `TEXT_CANDIDATE`；`is_trusted_scope` 是权限与触发**共用的唯一谓词** | 不判权限、不读 DB、不判采集资格（属 S2）、不做指令分流 |
 | `context_assembly.py` | 人格分层与静态规则 + 动态材料装配（S1-11 + S2-06）：`STATIC_RULES`/`PERSONA_VERSION`/`build_chat_plan()`；`render_materials()`（短标签、转义昵称、相对时间、同事件去重）、`trim_to_budget()`（8192 预算，先裁最旧材料再裁最旧历史，无法裁剪即返回 `None` 拒绝）；固定规则只进 system | 不组装上下文材料以外的东西、不调模型、不接受事件对象（因而读不到 `message_str`）、不导入框架（临时标记由 `main.py` 施加） |
-| `history.py` | `@` 互动历史（S2-07）：`_at` 私有键、成对解析（不合格条目保守丢弃）、20 轮/24 小时取严、`flatten()` 剥离私有键、`storage_entries()` 写回形状、`should_record()`（送达 ∧ 非记忆辅助轮） | 不导入框架、不做 IO、不判权限、不复制全历史（存储归框架会话存储） |
+| `history.py` | `@` 互动历史（S2-07/S2-08）：`_at` 私有键、成对解析（不合格条目保守丢弃）、20 轮/24 小时取严、`flatten()` 剥离私有键、`storage_entries()` 写回形状、`should_record()`（送达 ∧ 非记忆辅助轮）、`trim_stored()`（启动裁剪只动 `_at` 成对条目） | 不导入框架、不做 IO、不判权限、不复制全历史（存储归框架会话存储）；裁剪不误删框架条目 |
 | `notice.py` | 群告知文案与两步确认窗口（S2-02）：`NOTICE_TEXT`/`NOTICE_VERSION`（附录 C.1 逐字 + 指纹）、每群单槽 5 分钟窗口（换人即作废、有界、惰性淘汰）、`describe_policy()` 状态行 | 不导入框架/sqlite/asyncio、不做 IO、不调模型、不发消息、不判权限、不读配置（版本由调用方传入） |
 | `keys.py` | `BotInstanceKey` / `GroupKey` / `MemberKey`、`RevisionSnapshot`；只由可信元数据构造，缺一段即构造失败 | 不用昵称/群名/正文构造键 |
 | `commands.py` | 纯解析 `CommandIntent` + 所需权限档；空白归一化 | 不核权、不执行、不调模型；**调用前提是调用方已确认真实 @** |
@@ -163,6 +163,12 @@ docs/03 §3.2 的目录树是**拟议结构**，不是现状清单——判断�
 - R21：存储路径解析失败（`StarTools.get_data_dir()` 探测不到插件名、库损坏等）会**静默降级**为
   "无存储"：采集与 `上下文 退出/加入` 全部关闭，插件照常聊天，只有 `千鹤 状态` 的降级行可见。
 - R11：原生流程在发送门控前就已写入历史（`STAGES_ORDER` 中 ProcessStage 早于 RespondStage）。
+- K15：`PlatformMessageHistoryManager.delete` 的 **docstring 与实现相反**——删的是"最近 offset 秒内"
+  （`created_at >= now - offset`），默认 `86400` 只清最近 24 小时；整体删除的唯一惯用法是
+  `offset_sec=99999999`。另：QQ 群消息经 `event.send` **不写**这张表（只有内置群历史开关或
+  `Context.send_message` 才写），所以清理它是幂等防御动作。
+- K15 相关：`ConversationManager.get_conversations(platform_id=...)` **只在 platform_id 为真时过滤**，
+  空串会枚举全实例会话——插件侧必须先挡掉空 `platform_id`。
 
 ## 开发工作流
 

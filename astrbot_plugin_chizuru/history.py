@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Mapping, Protocol, Sequence
 
 AT_KEY = "_at"
 """时间戳私有键。与框架自身的 `_checkpoint` / `_no_save` 同属"存储里有、请求里没有"的键；
@@ -59,34 +59,120 @@ def _valid_at(item: Mapping[str, object]) -> int | None:
     return None
 
 
+@dataclass(frozen=True)
+class _Pair:
+    """一对已识别的 `_at` 条目在原始列表中的位置（启动裁剪按位置删除）。"""
+
+    user_index: int
+    assistant_index: int
+    at: int
+
+
+class _Timed(Protocol):
+    """带 `_at` 的对象：`Turn` 与 `_Pair` 都满足，供保留规则共用。"""
+
+    at: int
+
+
+def _pair_positions(items: Sequence[object]) -> tuple[_Pair, ...]:
+    """识别"带同一 `_at` 的 user→assistant 相邻对"，返回其位置（不复制内容）。
+
+    解析与裁剪共用同一次遍历：**只有这里能决定什么是"本插件的轮次"**。
+    """
+    pairs: list[_Pair] = []
+    pending: tuple[int, int] | None = None  # (index, at)
+    for index, item in enumerate(items):
+        at = _valid_at(item) if isinstance(item, dict) else None
+        if pending is not None and at == pending[1] and _valid_entry(item, "assistant"):
+            pairs.append(_Pair(user_index=pending[0], assistant_index=index, at=pending[1]))
+            pending = None
+            continue
+        if at is not None and _valid_entry(item, "user"):
+            # 连续两条 user 说明序列已损坏：两条都不采用（保守），后续 assistant 也不配对。
+            pending = None if pending is not None else (index, at)
+            continue
+        pending = None
+    return tuple(pairs)
+
+
+def _decode(raw: str | None) -> list | None:
+    """解析会话存储的 JSON 原文；畸形输入返回 `None`（"读不出来"，不是"空"）。"""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        items = json.loads(raw)
+    except ValueError:
+        return None
+    return items if isinstance(items, list) else None
+
+
 def parse(raw: str | None) -> tuple[Turn, ...]:
     """把会话存储的 JSON 原文解析成轮次；**任何不合格条目都保守丢弃**。
 
     只承认"带同一 `_at` 的 user→assistant 相邻对"；畸形 JSON、非列表、缺时间戳、
     单条悬挂、以及框架的 `_checkpoint` 段一律不进入结果。
     """
-    if not isinstance(raw, str) or not raw.strip():
+    items = _decode(raw)
+    if items is None:
         return ()
-    try:
-        items = json.loads(raw)
-    except ValueError:
-        return ()
-    if not isinstance(items, list):
-        return ()
-    turns: list[Turn] = []
-    pending: tuple[int, Mapping[str, object]] | None = None
-    for item in items:
-        at = _valid_at(item) if isinstance(item, dict) else None
-        if pending is not None and at == pending[0] and _valid_entry(item, "assistant"):
-            turns.append(Turn(at=pending[0], user=pending[1], assistant=item))
-            pending = None
-            continue
-        if at is not None and _valid_entry(item, "user"):
-            # 连续两条 user 说明序列已损坏：两条都不采用（保守），后续 assistant 也不配对。
-            pending = None if pending is not None else (at, item)
-            continue
-        pending = None
-    return tuple(turns)
+    return tuple(
+        Turn(at=pair.at, user=items[pair.user_index], assistant=items[pair.assistant_index])
+        for pair in _pair_positions(items)
+    )
+
+
+def _validate_window(*, max_turns: int, ttl_seconds: float) -> None:
+    if not isinstance(max_turns, int) or isinstance(max_turns, bool) or max_turns < 1:
+        raise ValueError("max_turns 必须是正整数")
+    if not isinstance(ttl_seconds, (int, float)) or isinstance(ttl_seconds, bool) or ttl_seconds <= 0:
+        raise ValueError("ttl_seconds 必须是正数")
+
+
+def _keep_last(
+    entries: Sequence[_Timed],
+    *,
+    max_turns: int,
+    ttl_seconds: float,
+    now_epoch: int,
+) -> list[_Timed]:
+    """有效期内的最近 `max_turns` 项；**到期判定取严**（年龄恰等 TTL 即过期）。
+
+    解析（`Turn`）与存储裁剪（`_Pair`）共用这一条规则，避免两侧漂移。
+    """
+    fresh = [entry for entry in entries if now_epoch - entry.at < ttl_seconds]
+    return fresh[-max_turns:]
+
+
+def trim_stored(
+    raw: str | None,
+    *,
+    max_turns: int,
+    ttl_seconds: float,
+    now_epoch: int,
+) -> tuple[dict, ...] | None:
+    """启动裁剪的**写回计划**（S2-08）：返回新的条列表，`None` 表示无需改动。
+
+    只移除过期或超轮的 `_at` 成对条目；**未识别条目原样保留**——同一张会话表里可能
+    有框架的 `_checkpoint`、别的来源、或没有 `_at` 的历史，裁剪不得顺手删掉它们。
+    一个可识别的轮次都没裁掉时返回 `None`（绝不因为"解析不出来"就整体覆盖）。
+    """
+    items = _decode(raw)
+    if items is None:
+        return None
+    _validate_window(max_turns=max_turns, ttl_seconds=ttl_seconds)
+    pairs = _pair_positions(items)
+    if not pairs:
+        return None
+    kept = {pair.user_index for pair in _keep_last(pairs, max_turns=max_turns, ttl_seconds=ttl_seconds, now_epoch=now_epoch)}
+    dropped = {
+        index
+        for pair in pairs
+        if pair.user_index not in kept
+        for index in (pair.user_index, pair.assistant_index)
+    }
+    if not dropped:
+        return None
+    return tuple(item for index, item in enumerate(items) if index not in dropped)
 
 
 def select(
@@ -97,12 +183,8 @@ def select(
     now_epoch: int,
 ) -> tuple[Turn, ...]:
     """保留有效期内的最近 `max_turns` 轮；**到期判定取严**（年龄恰等 TTL 即过期）。"""
-    if not isinstance(max_turns, int) or isinstance(max_turns, bool) or max_turns < 1:
-        raise ValueError("max_turns 必须是正整数")
-    if not isinstance(ttl_seconds, (int, float)) or isinstance(ttl_seconds, bool) or ttl_seconds <= 0:
-        raise ValueError("ttl_seconds 必须是正数")
-    fresh = tuple(turn for turn in turns if now_epoch - turn.at < ttl_seconds)
-    return fresh[-max_turns:]
+    _validate_window(max_turns=max_turns, ttl_seconds=ttl_seconds)
+    return tuple(_keep_last(turns, max_turns=max_turns, ttl_seconds=ttl_seconds, now_epoch=now_epoch))
 
 
 def make_turn(*, user_text: str, assistant_text: str, at_epoch: int) -> Turn:

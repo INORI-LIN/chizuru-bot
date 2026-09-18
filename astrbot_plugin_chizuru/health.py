@@ -131,6 +131,7 @@ class HealthSnapshot:
     degradations: frozenset[Degradation] = frozenset()
     extraction_failures: int = 0
     extraction_successes: int = 0
+    cleanup_failures: int = 0
     budget: BudgetSnapshot | None = None
     scheduler: SchedulerStats | None = None
 
@@ -143,6 +144,7 @@ class HealthSnapshot:
             raise ValueError("degradations 必须是 Degradation 的 frozenset")
         _require_count(self.extraction_failures, "extraction_failures")
         _require_count(self.extraction_successes, "extraction_successes")
+        _require_count(self.cleanup_failures, "cleanup_failures")
         if self.budget is not None and not isinstance(self.budget, BudgetSnapshot):
             raise ValueError("budget 必须是 BudgetSnapshot 或 None")
         if self.scheduler is not None and not isinstance(self.scheduler, SchedulerStats):
@@ -165,6 +167,7 @@ class HealthMonitor:
         self._degradations: set[Degradation] = set()
         self._extraction_failures = 0
         self._extraction_successes = 0
+        self._cleanup_failures = 0
 
     # ---- 观测 ----
 
@@ -231,6 +234,18 @@ class HealthMonitor:
         self._extraction_successes += 1
         return self._extraction_successes
 
+    def record_cleanup_failure(self) -> int:
+        """记一次"清理未能确认完成"（S2-08 的待维护错误登记），返回累计值。
+
+        **只增不清**：一次失败过的删除在重启前都算未恢复；重启会让计数与
+        `DELETION_FAILED` 一起归零，这是已知限制（docs/03 §5.2、R23）。
+        """
+        self._cleanup_failures += 1
+        return self._cleanup_failures
+
+    def cleanup_failures(self) -> int:
+        return self._cleanup_failures
+
     # ---- 快照 ----
 
     def snapshot(
@@ -244,6 +259,7 @@ class HealthMonitor:
             degradations=frozenset(self._degradations),
             extraction_failures=self._extraction_failures,
             extraction_successes=self._extraction_successes,
+            cleanup_failures=self._cleanup_failures,
             budget=budget,
             scheduler=scheduler,
         )
@@ -293,6 +309,10 @@ def format_report(snapshot: HealthSnapshot, *, configured: bool) -> tuple[str, .
     lines.append(
         f"抽取：成功 {snapshot.extraction_successes} 次，失败 {snapshot.extraction_failures} 次"
     )
+
+    if snapshot.cleanup_failures:
+        # 仅在有失败时输出（**新文案待评审**）：0 次不占行，也不改变既有报告的末行。
+        lines.append(f"清理失败：{snapshot.cleanup_failures} 次（待维护者复跑清理命令）")
 
     if snapshot.budget is not None:
         budget = snapshot.budget

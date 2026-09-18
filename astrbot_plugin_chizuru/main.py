@@ -117,6 +117,13 @@ DEDUP_CAPACITY = 2048
 UNKNOWN_MODEL = "unknown"
 """提供商未暴露模型名时的预算预留键；价目表为空时不参与定价。"""
 
+DELETE_ALL_HISTORY_SECONDS = 99_999_999
+"""平台消息历史的"整体删除"窗口（≈3.17 年）。
+
+**上游把默认值 86400 的语义写反了**：`delete(..., offset_sec)` 删的是"最近 offset 秒内"
+（`db/sqlite.py` 的 SQL 是 `created_at >= now - offset`），默认只清最近 24 小时。
+dashboard 删除会话时用的就是这个超大窗口，本插件沿用它，并在文档里记下该事实。"""
+
 
 @dataclass
 class _Services:
@@ -172,6 +179,36 @@ class _ConversationHistory:
             conversation_id = await manager.new_conversation(umo)
         await manager.update_conversation(umo, conversation_id=conversation_id, history=list(entries))
 
+    async def sweep(
+        self,
+        platform_id: str,
+        trim: Callable[[str | None], tuple[dict, ...] | None],
+    ) -> tuple[int, int]:
+        """启动裁剪（S2-08）：枚举本平台会话，`trim` 给出新条列表时写回。
+
+        返回 `(改动数, 失败数)`：单个会话失败不放弃其余会话；枚举本身失败向上抛。
+        `trim` 是纯策略（`history.trim_stored` 的部分应用），适配器不解释它，
+        因此"只裁本插件的 `_at` 成对条目"这条规则只有一处实现。
+        """
+        manager = self._manager()
+        conversations = await manager.get_conversations(platform_id=platform_id)
+        changed = 0
+        failed = 0
+        for conversation in conversations or ():
+            try:
+                trimmed = trim(getattr(conversation, "history", None))
+                if trimmed is None:
+                    continue
+                await manager.update_conversation(
+                    conversation.user_id,
+                    conversation_id=conversation.cid,
+                    history=list(trimmed),
+                )
+                changed += 1
+            except Exception:
+                failed += 1
+        return changed, failed
+
 
 class ChizuruPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
@@ -216,6 +253,45 @@ class ChizuruPlugin(Star):
                 clock=self.clock,
             ),
             notice=notice.NoticeGate(clock=self.clock),
+        )
+        await self._sweep_history(settings)
+
+    async def _sweep_history(self, settings: Settings) -> None:
+        """启动清理（S2-08，架构 §6.3"正常重启"）：裁掉会话存储里过期或超轮的轮次。
+
+        三条边界：`platform_id` 为空直接跳过（上游只在它非空时过滤，空串会扫到全实例
+        的会话）；取不到框架会话接口（未装配、测试替身）什么都不做；失败只记审计与
+        计数，**不置粘滞降级**——过期轮次在读侧本来就不会进入请求，为一次启动抖动
+        停掉整进程采集换不到隐私收益（成员主动删除的失败路径另按 §8.3 置降级）。
+        """
+        services = self.services
+        if services is None or not settings.platform_id:
+            return
+        store = self._history()
+        sweep = getattr(store, "sweep", None)
+        if sweep is None:
+            return
+        if self.history_store is None and not hasattr(self.context, "conversation_manager"):
+            # 框架没暴露会话接口（未装配、测试替身）：**没有可清的东西，不是失败**。
+            return
+        try:
+            changed, failed = await sweep(settings.platform_id, self._trim_plan(settings))
+        except Exception:
+            self._record_cleanup_failure(services)
+            return
+        if changed:
+            self._audit(services, redact.EventCategory.CONTEXT_OP, count=changed)
+        if failed:
+            self._record_cleanup_failure(services, count=failed)
+
+    def _trim_plan(self, settings: Settings) -> Callable[[str | None], tuple[dict, ...] | None]:
+        """把窗口参数固定成纯策略交给存储适配器；时钟在启动时刻取一次。"""
+        now_epoch = self._now_epoch()
+        return lambda raw: history.trim_stored(
+            raw,
+            max_turns=settings.context.history_max_turns,
+            ttl_seconds=settings.context.history_ttl_hours * 3600,
+            now_epoch=now_epoch,
         )
 
     async def terminate(self) -> None:
@@ -1115,21 +1191,40 @@ class ChizuruPlugin(Star):
         )
 
     async def _clear_group_history(self, event: AstrMessageEvent, services: _Services) -> None:
-        """清理该群互动历史；失败只登记降级，不重试、不虚报（重试属 S2-08）。"""
+        """清理该群互动历史；失败只登记降级与计数，不重试、不虚报（重试属 S2-08 的结论：不重试）。"""
         cleaner = self.history_cleaner or self._delete_group_history
         try:
             await cleaner(event.unified_msg_origin)
         except Exception:
             services.health.set_degraded(health.Degradation.DELETION_FAILED)
-            self._audit(
-                services,
-                redact.EventCategory.CLEANUP_FAILURE,
-                code=redact.ErrorCode.DELETE_FAILED,
-            )
+            self._record_cleanup_failure(services)
+
+    def _record_cleanup_failure(self, services: _Services, *, count: int = 1) -> None:
+        """登记一次"清理未能确认完成"（S2-08）：只增计数 + 留审计，不发群消息。"""
+        services.health.record_cleanup_failure()
+        self._audit(
+            services,
+            redact.EventCategory.CLEANUP_FAILURE,
+            code=redact.ErrorCode.DELETE_FAILED,
+            count=count,
+        )
 
     async def _delete_group_history(self, umo: str) -> None:
-        """原生会话删除（K9）：群共享会话下按 umo 删除即整群互动历史（R14）。"""
+        """原生历史清理（K9/R14 + S2-08）：**会话历史 + 平台消息历史**两步都做。
+
+        平台消息历史那张表在本插件路径下本应为空（QQ 群消息经 `event.send` 不落表），
+        这里是**幂等防御性清理**：只有部署曾打开内置群历史开关时才会真正删到东西。
+        任何一步失败都抛给调用方，由它置降级并登记——**不虚报已删除**。
+        """
         await self.context.conversation_manager.delete_conversations_by_user_id(umo)
+        platform_id = umo.partition(":")[0]
+        if not platform_id:
+            raise ValueError("umo 缺少平台实例段，无法确认平台消息历史已清理")
+        await self.context.message_history_manager.delete(
+            platform_id=platform_id,
+            user_id=umo,
+            offset_sec=DELETE_ALL_HISTORY_SECONDS,
+        )
 
     # ---- 唯一出站路径 ----
 

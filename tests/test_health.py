@@ -257,6 +257,24 @@ class ReportTests(unittest.TestCase):
         self.assertIn(ACCOUNT_STATE_NOTE, lines)
         self.assertEqual(lines[-1], "抽取：成功 0 次，失败 0 次")
 
+    def test_cleanup_failures_are_counted_and_reported_only_when_present(self):
+        monitor = HealthMonitor()
+        self.assertEqual(monitor.cleanup_failures(), 0)
+        self.assertNotIn("清理失败", "\n".join(format_report(monitor.snapshot(), configured=True)))
+
+        self.assertEqual(monitor.record_cleanup_failure(), 1)
+        self.assertEqual(monitor.record_cleanup_failure(), 2)
+        snapshot = monitor.snapshot()
+        self.assertEqual(snapshot.cleanup_failures, 2)
+        lines = format_report(snapshot, configured=True)
+        self.assertIn("清理失败：2 次（待维护者复跑清理命令）", lines)
+        # 抽取行仍在清理行之前，且计数为 0 时报告完全不变（既有末行断言依赖它）。
+        self.assertLess(lines.index("抽取：成功 0 次，失败 0 次"), lines.index("清理失败：2 次（待维护者复跑清理命令）"))
+
+    def test_cleanup_failure_count_must_be_a_count(self):
+        with self.assertRaises(ValueError):
+            HealthSnapshot(platform=health(), cleanup_failures=-1)
+
     def test_sentinel_configuration_is_reported_as_closed(self):
         snapshot = HealthSnapshot(
             platform=health(instance_present=False, state=PlatformState.INSTANCE_MISSING),
