@@ -11,14 +11,16 @@ This file provides guidance to CodeBuddy Code when working with code in this rep
 
 **当前状态：未上线。** S0 离线核验完成，但 **S0 阶段门于 2026-09-17 被维护者决定有意跳过（不是通过）**，
 在线部分（真实 QQ/NapCat/DeepSeek）从未验证。S1 进行中：`S1-01`—`S1-15` 的**离线部分**均已完成
-（含 `main.py` 装配与离线回归），`S1-16` 阶段门与 `S1-10` 的在线部分仍【阻塞·在线/凭据】；
-S2/S3/S4 未开始。
+（含 `main.py` 装配与离线回归），`S1-16` 阶段门与 `S1-10` 的在线部分仍【阻塞·在线/凭据】。
+**S2 于 2026-09-18 离线先行**（docs/03 §9.5）：`S2-01`/`S2-03`/`S2-04` 的**离线部分**已完成
+（`storage/`、`context_buffer.py` 与 `main.py` 接线），`S2-02`/`S2-05` 因目标群与维护者清单未提供
+保持【阻塞】，生产环境采集默认关闭；S2-06——S2-10、S3、S4 未开始。
 
 | 文档 | 角色 |
 |---|---|
 | [`docs/01-requirements.md`](docs/01-requirements.md) | 需求编号 R-* 与验收用例 A01—A19；**验收依据，与本文档冲突时以其为准** |
 | [`docs/02-architecture.md`](docs/02-architecture.md) | 信任边界、数据生命周期、并发与故障策略、环境基线、§14 实施记录 |
-| [`docs/03-implementation-plan.md`](docs/03-implementation-plan.md) | 阶段门禁、任务卡、依赖图、风险登记 R1—R16、附录 D（S0 证据）；**进度唯一权威** |
+| [`docs/03-implementation-plan.md`](docs/03-implementation-plan.md) | 阶段门禁、任务卡、依赖图、风险登记 R1—R21、附录 D（S0 证据）；**进度唯一权威** |
 
 ## 常用命令
 
@@ -30,7 +32,7 @@ export ASTRBOT_BUILD_DASHBOARD=0   # 阻止上游构建钩子运行 npm
 ```
 
 ```sh
-# 全量离线核验：7 个核验脚本 + 全部单元测试（当前共 318 项单元测试）
+# 全量离线核验：7 个核验脚本 + 全部单元测试（当前共 407 项单元测试）
 bash scripts/s0/run_all.sh
 
 # 只跑全部单元测试
@@ -87,13 +89,18 @@ OneBot 事件 → main.py（唯一框架入口、薄适配，提取 MessageFacts
   → llm.py（S1-10 离线部分，直接调用原生提供商）→ send_gate.evaluate（S1-12）→ 唯一出站路径
 ```
 
-`main.py` 已按此装配（S1-14）：唯一出站路径是 `_deliver()`，群内出口目前只有 `千鹤 状态`。
+非 @ 的普通群聊只走采集支路：`policy.classify → IGNORE/… → main._maybe_collect`
+（受信范围 ∧ 形状 TEXT_ONLY ∧ 策略仓储 `is_collection_open` ∧ 成员未退出）→ `context_buffer.ingest`；
+**不产生任何出站或模型调用**。生产环境因策略仓储无行而默认关闭（S2-02 未落地）。
+
+`main.py` 已按此装配（S1-14 + S2-03/04）：唯一出站路径是 `_deliver()`，群内出口只有 `千鹤 状态`；
+`上下文 退出/加入` 执行状态变更但**静默无回执**（文案待审）。
 
 ### 模块边界（每个模块"必须不做"与职责同等重要）
 
 | 模块 | 职责 | 必须不做 |
 |---|---|---|
-| `main.py` | Star 生命周期、钩子注册（**只注册 `on_message`**）、唯一装配点与出站路径 `_deliver()` | 不写业务规则、不解析身份、不直接 `event.send`（出站必经 `send_gate`） |
+| `main.py` | Star 生命周期、钩子注册（**只注册 `on_message`**）、唯一装配点与出站路径 `_deliver()`；普通群聊采集分支与 `上下文 退出/加入`（S2-03/04） | 不写业务规则、不解析身份、不直接 `event.send`（出站必经 `send_gate`）；采集不落盘、不发消息、不调模型；`_group_state` 的持久化替换延后到 S2-02 |
 | `config.py` | fail-closed 配置模型：任一字段缺失或畸形 → 整体退回哨兵 `Settings()`（拒绝全部） | 不默认开启采集/记忆；密钥不进 `repr` |
 | `policy.py` | 纯触发形态分类：`IGNORE` / `EMPTY_OR_UNSUPPORTED` / `UNSUPPORTED_ATTACHMENT` / `TEXT_CANDIDATE`；`is_trusted_scope` 是权限与触发**共用的唯一谓词** | 不判权限、不读 DB、不判采集资格（属 S2）、不做指令分流 |
 | `context_assembly.py` | 人格分层与静态规则（S1-11 已实现静态部分）：`STATIC_RULES`/`PERSONA_VERSION`/`build_chat_plan()`；固定规则只进 system，动态材料只能经 `dynamic_parts`（S2-06） | 不组装上下文材料、不调模型、不接受事件对象（因而读不到 `message_str`） |
@@ -106,9 +113,11 @@ OneBot 事件 → main.py（唯一框架入口、薄适配，提取 MessageFacts
 | `health.py` | 平台状态归一化（只认 `Platform.status` 四个取值，其余落 `UNKNOWN`）、持久降级标志、抽取失败计数、供维护者查询的快照与文本 | 不导入框架、不探测、不发送；**不表示 QQ 登录态**（报告固定输出"未知"）；不读 `instance.config`（含 token）与任何错误文本/堆栈 |
 | `send_gate.py` | 出站前复核：源范围 → 源触发形态 → 目标群一致 → 群开关 → 修订号 → 发送不确定；不一致即丢弃 | 不发送、不调模型、不做补救；**群开关与修订号由调用方注入**（无默认值）；不提供任何回执/送达 API；固定提示构造时即禁止模型调用 |
 | `redact.py` | 类别化日志记录（`AuditRecord` 无自由文本字段）、错误码闭集、每进程加盐的关联标识、保留期与大小策略、AstrBot/NapCat 日志审计清单 | 不做日志 IO、不轮转文件（`logging` 都不导入）；不记正文/请求体/密钥/推理文本；关联摘要不可还原、跨重启不可关联（刻意取舍） |
+| `context_buffer.py` | 普通群聊内存环形缓冲（S2-03）：30 条/10 分钟取严、惰性淘汰、无后台任务；形状/命令/敏感/自身/重复全部拒绝；`clear_group`/`clear_member` | 不落盘、不请求模型、不发消息、不导入框架；**条数与 TTL 由调用方注入**；不采集未告知群 |
+| `storage/*` | 插件 SQLite（S2-01/S2-04）：`db`（延迟建库、短事务、失败不恢复）、`schema`（两张 STRICT 表 + `user_version`）、`groups`（群策略仓储，无行即关闭）、`members`（退出/加入 + 修订号） | 不在事务内等网络（纯同步、只 import 标准库）；不存全量群聊；不存记忆授权（S3）；路径由调用方注入（无默认值） |
 | `llm.py` | 请求成形（`LLMRequestPlan`，键集固定、无工具参数）、回复解释（只读 `role`/`completion_text`）、错误分类（状态码委托 `redact.ErrorCode`）、≤1 次重试判定（共用同一 `Deadline`）、usage 映射、`FollowUp` 类别 | 不发送、不导入框架、不建网关/客户端；不组装人格与上下文（S1-11）；不读写历史与存储；**不读取推理字段、不追加工具**；不含任何群内文案；**在线部分未验证**（真实 401/402/429/5xx 与 usage 仍待 S0-07） |
 
-**尚不存在**（属后续任务卡，不要 import）：`context_buffer.py`（S2-03）、`storage/`、`memory/`。
+**尚不存在**（属后续任务卡，不要 import）：`memory/`（S3）。
 docs/03 §3.2 的目录树是**拟议结构**，不是现状清单——判断某文件是否存在请直接看仓库。
 
 ### 不可违背的硬约束
@@ -140,6 +149,8 @@ docs/03 §3.2 的目录树是**拟议结构**，不是现状清单——判断�
 - R15：保留内置插件不受 `disable_builtin_commands` 约束，其 `handle_empty_mention` 优先级高于本插件
   且会 `stop_event()`；唯一关闭手段是 `platform_settings.empty_mention_waiting`。
 - R16：框架对会话与平台消息历史**无原生 TTL**，20 轮/24 小时与 90 天全部需插件自建清理。
+- R21：存储路径解析失败（`StarTools.get_data_dir()` 探测不到插件名、库损坏等）会**静默降级**为
+  "无存储"：采集与 `上下文 退出/加入` 全部关闭，插件照常聊天，只有 `千鹤 状态` 的降级行可见。
 - R11：原生流程在发送门控前就已写入历史（`STAGES_ORDER` 中 ProcessStage 早于 RespondStage）。
 
 ## 开发工作流
@@ -174,6 +185,9 @@ docs/03 §3.2 的目录树是**拟议结构**，不是现状清单——判断�
 - **装配级测试必须替换 `event.send`**：真实实现会 `asyncio.create_task(Metric.upload(...))`
   并联网，离线守卫会拒绝且破坏"terminate 后无新增任务"的不变量。`tests/fakes.py` 不是
   测试模块（文件名不匹配 `test*.py`），也不要 import `scripts/s0/`。
+- 存储类测试（`tests/test_storage_*.py`）用 `tempfile` 在 `.runtime/` 下建临时库（K12 只放行
+  该前缀）；装配级用例经 `plugin.storage_path` 注入库路径，并把 `plugin.history_cleaner`
+  换成 `fakes.FakeHistoryCleaner`（真实实现会触框架会话库与数据库）。
 - S0 核验脚本在独立进程运行，共享引导在 `scripts/s0/_harness.py`（`Harness` + `Checker`）；
   **每个进程只能建立一个 `Harness`**（audit hook 不可卸载）。新脚本照抄该模板即可获得
   隔离 `ASTRBOT_ROOT`、11 类事件门控矩阵所需的真假事件与出站/模型调用记录器。

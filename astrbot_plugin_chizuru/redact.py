@@ -68,6 +68,9 @@ class EventCategory(StrEnum):
     MEMORY_OP = "memory_op"
     """记忆操作成功/失败计数。"""
 
+    CONTEXT_OP = "context_op"
+    """普通群上下文操作（退出/加入、采集状态）成功/失败计数。"""
+
     CLEANUP_FAILURE = "cleanup_failure"
     DEGRADATION = "degradation"
 

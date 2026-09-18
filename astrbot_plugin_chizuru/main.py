@@ -22,13 +22,19 @@
 被框架取消（`CancelledError`）时条目留在 `IN_FLIGHT`，由 TTL 收敛：不确定是否已发送，
 就不重放（架构 §6.1）。
 
-**S1 的临时边界**（均记入 docs/03 §5.2，落地后回改）：
+**临时边界与已知限制**（均记入 docs/03 §5.2，落地后回改）：
 
-- 群开关由部署配置推导（`Settings.allows_group` 命中即 `OPEN`）：S1 没有持久化群策略
-  （S2-01 才有），也没有暂停/关闭通道（S2-05 才有）。
+- 群开关（`send_gate` 的 `GroupState`）仍由部署配置推导：持久化群策略已在 S2-01 落地，
+  但**替换延后到 S2-02**——S2-02 之前没有任何合法途径写出"已告知 + 开启"，提前替换只会
+  让聊天静默停摆。聊天不要求告知，采集才要求。
+- 普通群聊采集（S2-03）与 `上下文 退出/加入`（S2-04）已接线；采集准入读持久化群策略
+  （**无行即关闭**），因此 S2-02/S2-05 落地前生产环境实际不采集、暂停/关闭命令也不存在。
+- 存储路径来自 AstrBot 插件数据目录，**延迟建库**（不写不建文件）；解析或打开失败即
+  降级为"无存储"，采集与退出/加入保持关闭，`千鹤 状态` 可见。
 - 去重窗口与容量是装配层常量，标注"建议参数待评审"——取值依赖仍未在线核验的 O-07。
-- 群内出口只有 `千鹤 状态`（用 `health.format_report` 的既有文本）；附件提示与其它
-  控制指令一律静默：文案属附录 C 待审范围，执行属 S2-05/S3-04，此刻发明文案会先于评审。
+- 群内出口只有 `千鹤 状态`（用 `health.format_report` 的既有文本）；`上下文 退出/加入`
+  执行但**静默无回执**，其余控制指令不执行：回执文案属附录 C 待审范围，执行属
+  S2-05/S3-04，此刻发明文案会先于评审。
 - 聊天失败不发任何群内提示：同样的理由（架构 §8.3 的失败文案属 S4-01）。
 - `limits` 与 `budget` 在 `initialize()` 时固定，运行时改动需重载插件；身份、允许群、
   维护者映射与金额开关每个事件重读（配置变更即时生效）。
@@ -44,21 +50,33 @@ import asyncio
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable
+from pathlib import Path
+from typing import Awaitable, Callable, Sequence
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import At, File, Image, Plain, Record, Video
-from astrbot.api.star import Context, Star
+from astrbot.api.message_components import (
+    At,
+    File,
+    Forward,
+    Image,
+    Nodes,
+    Plain,
+    Record,
+    Reply,
+    Video,
+)
+from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.platform.message_type import MessageType
 
-from . import commands, context_assembly, health, llm, redact
+from . import commands, context_assembly, health, llm, redact, storage
 from .budget import BudgetLedger, BudgetRefusal, BudgetRefused, PriceTable, Reservation, UsageKind
 from .config import Settings
+from .context_buffer import BufferShape, ContextBuffer, IngestOutcome
 from .control import authorize
 from .dedup import ActionKind, Claim, DedupKey, DedupStore, Outcome
-from .keys import BotInstanceKey, GroupKey
-from .policy import Classification, MessageFacts, classify
+from .keys import BotInstanceKey, GroupKey, MemberKey
+from .policy import Classification, MessageFacts, classify, is_trusted_scope
 from .scheduler import AdmissionRefused, Deadline, DeadlineExceeded, Scheduler
 from .send_gate import (
     DropReason,
@@ -95,6 +113,8 @@ class _Services:
     scheduler: Scheduler
     health: health.HealthMonitor
     redactor: redact.Redactor
+    storage: storage.Storage | None
+    context_buffer: ContextBuffer
 
 
 class ChizuruPlugin(Star):
@@ -106,6 +126,8 @@ class ChizuruPlugin(Star):
         self.clock: Callable[[], float] = time.monotonic
         self.datetime_clock: Callable[[], datetime] = datetime.now
         self.redactor_salt: bytes | None = None
+        self.storage_path: Path | None = None
+        self.history_cleaner: Callable[[str], Awaitable[None]] | None = None
 
     # ---- 生命周期 ----
 
@@ -114,6 +136,7 @@ class ChizuruPlugin(Star):
         if self.services is not None:
             return
         settings = Settings.from_mapping(self.config)
+        monitor = health.HealthMonitor()
         self.services = _Services(
             dedup=DedupStore(
                 window_seconds=DEDUP_WINDOW_SECONDS,
@@ -126,16 +149,58 @@ class ChizuruPlugin(Star):
                 clock=self.datetime_clock,
             ),
             scheduler=Scheduler(settings.limits, monotonic=self.clock),
-            health=health.HealthMonitor(),
+            health=monitor,
             redactor=redact.Redactor(salt=self.redactor_salt),
+            storage=self._open_storage(monitor),
+            context_buffer=ContextBuffer(
+                max_messages=settings.context.buffer_max_messages,
+                ttl_seconds=settings.context.buffer_ttl_seconds,
+                clock=self.clock,
+            ),
         )
 
     async def terminate(self) -> None:
-        """释放调度器：拒绝新提交并唤醒等待者。本插件不持有后台任务。"""
+        """释放存储与调度器：拒绝新提交并唤醒等待者。本插件不持有后台任务。"""
         services = self.services
         self.services = None
         if services is not None:
+            if services.storage is not None:
+                services.storage.close()
             await services.scheduler.aclose()
+
+    # ---- 存储 ----
+
+    def _open_storage(self, monitor: health.HealthMonitor) -> storage.Storage | None:
+        """解析数据目录并打开存储；任何失败都降级为"无存储"，绝不抛出。
+
+        无存储 = 不采集、不可退出/加入（架构 §8.3 的"保持关闭"），并在 `千鹤 状态`
+        中可见；聊天不依赖存储，仍然可用。
+        """
+        path = self._resolve_storage_path()
+        if path is None:
+            monitor.set_degraded(health.Degradation.MEMORY_STORE_FAILED)
+            return None
+        try:
+            return storage.open_storage(path, clock=self._now_epoch)
+        except storage.StorageFailure:
+            monitor.set_degraded(health.Degradation.MEMORY_STORE_FAILED)
+            return None
+
+    def _resolve_storage_path(self) -> Path | None:
+        """存储路径：测试用 `self.storage_path` 注入，生产取 AstrBot 插件数据目录。
+
+        `StarTools.get_data_dir()` 按调用栈识别插件，因此必须在本模块内调用；
+        它只创建数据目录，不创建库文件（建库是首次写入的事）。
+        """
+        if self.storage_path is not None:
+            return self.storage_path
+        try:
+            return StarTools.get_data_dir() / storage.DB_FILE_NAME
+        except Exception:
+            return None
+
+    def _now_epoch(self) -> int:
+        return int(self.datetime_clock().timestamp())
 
     # ---- 事实提取 ----
 
@@ -177,9 +242,13 @@ class ChizuruPlugin(Star):
         event.set_extra(CLASSIFICATION_EXTRA, classification.value)
 
         services = self.services
-        if services is None or classification is not Classification.TEXT_CANDIDATE:
-            # 未装配或非文本候选：IGNORE / 空 @ / 附件都不产生任何出站（需求 §4.1）。
-            if services is not None:
+        if services is None:
+            return
+        if classification is not Classification.TEXT_CANDIDATE:
+            # 非文本候选只可能进普通群聊缓冲；未告知群、私聊、@全体、附件与命令
+            # 一律在 `_maybe_collect` 内被拒绝（需求 §4.1/§4.2），零出站零模型调用。
+            outcome = self._maybe_collect(event, facts, settings, services)
+            if outcome is not IngestOutcome.STORED:
                 self._audit(services, redact.EventCategory.IGNORED)
             return
 
@@ -189,9 +258,84 @@ class ChizuruPlugin(Star):
             await self._handle_chat(event, facts, settings, services)
         elif intent.kind is commands.CommandKind.STATUS:
             await self._handle_status(event, facts, settings, services, intent)
+        elif intent.kind in (
+            commands.CommandKind.CONTEXT_LEAVE,
+            commands.CommandKind.CONTEXT_JOIN,
+        ):
+            await self._handle_context_switch(event, facts, settings, services, intent)
         else:
             # 其它控制指令的执行与文案分别属 S2-05/S3-04 与附录 C 待审范围。
             self._audit(services, redact.EventCategory.IGNORED)
+
+    # ---- 普通群聊采集（S2-03） ----
+
+    def _maybe_collect(
+        self,
+        event: AstrMessageEvent,
+        facts: MessageFacts,
+        settings: Settings,
+        services: _Services,
+    ) -> IngestOutcome | None:
+        """尝试把一条普通群聊写入内存缓冲；不产生任何出站或模型调用。
+
+        准入只来自可信事实与持久化状态：策略仓储**没有行就是关闭**，因此"未告知
+        不采集"不依赖任何默认放行（S2-02 落地前后同样成立）。群开关的临时来源
+        （部署配置）不参与采集判定——采集要求告知，聊天不要求。
+        """
+        stored = services.storage
+        if stored is None or stored.database.failed:
+            return None
+        if services.health.degradations() & {
+            health.Degradation.MEMORY_STORE_FAILED,
+            health.Degradation.DELETION_FAILED,
+        }:
+            # 无法确认退出/删除状态时停止采集（架构 §8.3）。
+            return None
+        if not is_trusted_scope(facts, settings):
+            return None
+        shape = self._buffer_shape(event.get_messages())
+        if shape is not BufferShape.TEXT_ONLY:
+            return None
+        message_id = self._message_id(event)
+        if message_id is None:
+            return None
+
+        group = self._group_key(facts)
+        member = MemberKey(group, facts.sender_id)
+        try:
+            policy = stored.groups.policy(group)
+            if not policy.is_collection_open(required_notice_version=settings.notice_version):
+                return None
+            if stored.members.state(member).opted_out:
+                return None
+        except storage.StorageFailure:
+            services.health.set_degraded(health.Degradation.MEMORY_STORE_FAILED)
+            return None
+        return services.context_buffer.ingest(
+            group=group,
+            member=member,
+            message_id=message_id,
+            text=facts.direct_text,
+            shape=shape,
+        )
+
+    @staticmethod
+    def _buffer_shape(chain: Sequence[object]) -> BufferShape:
+        """把顶层消息组件映射为缓冲形状；只有纯文本可以进入缓冲。
+
+        只读顶层、不递归：引用与合并转发内的内容不参与判定，也不需要解析。
+        """
+        if any(isinstance(part, Reply) for part in chain):
+            return BufferShape.HAS_QUOTE
+        if any(isinstance(part, (Forward, Nodes)) for part in chain):
+            return BufferShape.HAS_FORWARD
+        if any(isinstance(part, At) for part in chain):
+            return BufferShape.HAS_MENTION
+        if any(isinstance(part, ATTACHMENT_COMPONENTS) for part in chain):
+            return BufferShape.HAS_ATTACHMENT
+        if chain and all(isinstance(part, Plain) for part in chain):
+            return BufferShape.TEXT_ONLY
+        return BufferShape.OTHER
 
     # ---- 聊天 ----
 
@@ -421,6 +565,95 @@ class ChizuruPlugin(Star):
         )
         self._audit(services, redact.EventCategory.PLATFORM_STATE, count=error_count)
 
+    # ---- 控制：上下文 退出 / 加入（S2-04） ----
+
+    async def _handle_context_switch(
+        self,
+        event: AstrMessageEvent,
+        facts: MessageFacts,
+        settings: Settings,
+        services: _Services,
+        intent: commands.CommandIntent,
+    ) -> None:
+        """成员本人的上下文退出/加入：确定性状态变更，**本批静默**（回执文案待审）。
+
+        顺序：先持久化 → 再清本人缓冲 → 最后清受影响群历史。即使历史清理失败，
+        采集也已经停止（fail-closed），且不虚报已删除（架构 §8.3）。
+        """
+        group = self._group_key(facts)
+        message_id = self._message_id(event)
+        if message_id is None:
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+        key = DedupKey(group=group, message_id=message_id, action=ActionKind.CHAT_REPLY)
+        if services.dedup.begin(key) is not Claim.FIRST:
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+        if not authorize(intent, facts, settings).allowed:
+            services.dedup.release(key)
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+
+        stored = services.storage
+        if stored is None or stored.database.failed:
+            # 无法持久化就什么都不做：不虚报成功，相关能力保持关闭。
+            services.health.set_degraded(health.Degradation.MEMORY_STORE_FAILED)
+            self._audit(
+                services,
+                redact.EventCategory.CONTEXT_OP,
+                parts=(facts.group_id, message_id),
+                code=redact.ErrorCode.MEMORY_STORE_FAILED,
+            )
+            services.dedup.finish(key, Outcome.COMPLETED)
+            return
+
+        member = MemberKey(group, facts.sender_id)
+        try:
+            if intent.kind is commands.CommandKind.CONTEXT_LEAVE:
+                stored.members.opt_out(member)
+                services.context_buffer.clear_member(member)
+                await self._clear_group_history(event, services)
+            else:
+                stored.members.opt_in(
+                    member,
+                    required_notice_version=settings.notice_version,
+                )
+        except storage.PolicyRefused:
+            # 本群未告知/未开启/已暂停：加入不生效，按忽略记录（不发提示）。
+            services.dedup.finish(key, Outcome.COMPLETED)
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+        except storage.StorageFailure:
+            services.health.set_degraded(health.Degradation.MEMORY_STORE_FAILED)
+            self._audit(
+                services,
+                redact.EventCategory.CONTEXT_OP,
+                parts=(facts.group_id, message_id),
+                code=redact.ErrorCode.MEMORY_STORE_FAILED,
+            )
+            services.dedup.finish(key, Outcome.COMPLETED)
+            return
+
+        self._audit(services, redact.EventCategory.CONTEXT_OP)
+        services.dedup.finish(key, Outcome.COMPLETED)
+
+    async def _clear_group_history(self, event: AstrMessageEvent, services: _Services) -> None:
+        """清理该群互动历史；失败只登记降级，不重试、不虚报（重试属 S2-08）。"""
+        cleaner = self.history_cleaner or self._delete_group_history
+        try:
+            await cleaner(event.unified_msg_origin)
+        except Exception:
+            services.health.set_degraded(health.Degradation.DELETION_FAILED)
+            self._audit(
+                services,
+                redact.EventCategory.CLEANUP_FAILURE,
+                code=redact.ErrorCode.DELETE_FAILED,
+            )
+
+    async def _delete_group_history(self, umo: str) -> None:
+        """原生会话删除（K9）：群共享会话下按 umo 删除即整群互动历史（R14）。"""
+        await self.context.conversation_manager.delete_conversations_by_user_id(umo)
+
     # ---- 唯一出站路径 ----
 
     async def _deliver(
@@ -481,7 +714,12 @@ class ChizuruPlugin(Star):
 
     @staticmethod
     def _group_state(settings: Settings, facts: MessageFacts) -> GroupState:
-        """S1 的群开关来源是部署配置（临时来源，S2-01 持久化群策略落地后替换）。"""
+        """群开关：S1 的临时来源是部署配置；替换为持久化策略**延后到 S2-02**。
+
+        聊天不要求告知、采集才要求：采集准入在 `_maybe_collect` 读策略仓储
+        （无行即关闭）。S2-02 之前没有写入"已告知 + 开启"的合法路径，此刻替换
+        只会让聊天静默停摆，不带来任何采集能力。
+        """
         if settings.allows_group(facts.platform_id, facts.self_id, facts.group_id):
             return GroupState.OPEN
         return GroupState.CLOSED

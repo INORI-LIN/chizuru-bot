@@ -11,6 +11,7 @@ import asyncio
 import ast
 import importlib
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -139,6 +140,8 @@ class AssemblyTestCase(unittest.IsolatedAsyncioTestCase):
         provider_error=None,
         platform_error=None,
         config=None,
+        storage_path=None,
+        history_cleaner=None,
     ):
         self.context = fakes.FakeContext(
             provider=provider,
@@ -147,8 +150,38 @@ class AssemblyTestCase(unittest.IsolatedAsyncioTestCase):
             platform_error=platform_error,
         )
         self.plugin = fakes.make_plugin(self.context, config or make_config(), clock=self.clock)
+        if storage_path is not None:
+            self.plugin.storage_path = storage_path
+        if history_cleaner is not None:
+            self.plugin.history_cleaner = history_cleaner
         await self.plugin.initialize()
         return self.plugin
+
+    def new_storage_path(self, name: str = "chizuru.db") -> Path:
+        """每次调用给出独立的临时库路径，避免用例之间互相污染持久状态。"""
+        directory = Path(tempfile.mkdtemp(prefix="storage-", dir=test_root))
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        return directory / name
+
+    def group_key(self, group_id: str = "20001"):
+        return plugin_module.GroupKey(
+            plugin_module.BotInstanceKey("qq-local", "10001"),
+            group_id,
+        )
+
+    def open_group(self, *, notice: str = "notice-1", group_id: str = "20001"):
+        """直接写策略仓储模拟 S2-02 完成告知；命令面仍由 S2-02/S2-05 交付。"""
+        return self.plugin.services.storage.groups.record_notice_confirmed(
+            self.group_key(group_id),
+            version=notice,
+            actor_id="30001",
+        )
+
+    def collected(self, group_id: str = "20001"):
+        return self.plugin.services.context_buffer.entries(self.group_key(group_id))
+
+    def plain(self, text="今天天气不错", **overrides):
+        return self.event([factory.Plain(text)], **overrides)
 
     def event(self, chain, **overrides):
         event = factory.event(chain, **overrides)
@@ -489,6 +522,237 @@ class LifecycleAndStructureTests(AssemblyTestCase):
         handlers = star_handlers_registry.get_handlers_by_module_name(MODULE_NAME)
         self.assertEqual(len(handlers), 1)
         self.assertEqual(handlers[0].extras_configs["priority"], 1000)
+
+
+class ContextCollectionTests(AssemblyTestCase):
+    """S2-03：普通群聊采集的准入与排除。
+
+    生产环境默认关闭（策略仓储无行即关闭，S2-02 未落地）；测试直接写策略模拟
+    S2-02 完成告知后的状态。采集不产生任何出站或模型调用。
+    """
+
+    async def test_collection_stays_off_without_storage(self):
+        provider = fakes.FakeProvider()
+        await self.start(provider=provider)
+        self.assertIsNone(self.plugin.services.storage)
+        await self.plugin.on_message(self.plain())
+        self.assertEqual(self.collected(), ())
+        self.assertEqual(self.sent, [])
+        self.assertEqual(provider.calls, [])
+
+    async def test_open_group_collects_plain_text(self):
+        provider = fakes.FakeProvider()
+        await self.start(provider=provider, storage_path=self.new_storage_path())
+        self.open_group()
+        await self.plugin.on_message(self.plain("今天天气不错"))
+        entries = self.collected()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].member_id, "30001")
+        self.assertEqual(entries[0].text, "今天天气不错")
+        self.assertEqual(self.sent, [])
+        self.assertEqual(provider.calls, [])
+
+    async def test_excluded_shapes_and_scopes_are_not_collected(self):
+        provider = fakes.FakeProvider()
+        await self.start(provider=provider, storage_path=self.new_storage_path())
+        self.open_group()
+        cases = (
+            ("私聊", [factory.Plain("你好")], {"private": True}),
+            ("未允许群", [factory.Plain("你好")], {"group_id": "20002"}),
+            ("机器人自身消息", [factory.Plain("你好")], {"sender_id": "10001"}),
+            ("@全体", [factory.AtAll(), factory.Plain("你好")], {}),
+            ("@他人", [factory.At(qq="10002"), factory.Plain("你好")], {}),
+            ("空 @", [factory.At(qq="10001")], {}),
+            ("引用", [factory.Reply(id="old", chain=[factory.Plain("旧")]), factory.Plain("在吗")], {}),
+            ("合并转发", [factory.Forward(id="forward-1")], {}),
+            ("附件", [factory.Image(file="unused.png")], {}),
+            ("命令", [factory.Plain("千鹤 状态")], {}),
+            ("敏感文本", [factory.Plain("我的手机号是13800138000")], {}),
+        )
+        for name, chain, overrides in cases:
+            with self.subTest(case=name):
+                await self.plugin.on_message(self.event(chain, **overrides))
+                self.assertEqual(self.collected(), ())
+        self.assertEqual(self.sent, [])
+        self.assertEqual(provider.calls, [])
+
+    async def test_closed_paused_or_opted_out_groups_stop_collection(self):
+        await self.start(storage_path=self.new_storage_path())
+        self.open_group()
+        group = self.group_key()
+        storage = self.plugin.services.storage
+
+        storage.groups.set_paused(group, paused=True)
+        await self.plugin.on_message(self.plain(message_id="paused"))
+        self.assertEqual(self.collected(), ())
+
+        storage.groups.set_paused(group, paused=False)
+        storage.members.opt_out(plugin_module.MemberKey(group, "30001"))
+        await self.plugin.on_message(self.plain(message_id="opted-out"))
+        self.assertEqual(self.collected(), ())
+
+        storage.groups.set_context_enabled(
+            group, enabled=False, required_notice_version="notice-1"
+        )
+        await self.plugin.on_message(self.plain(message_id="disabled"))
+        self.assertEqual(self.collected(), ())
+
+    async def test_degradation_stops_collection(self):
+        await self.start(storage_path=self.new_storage_path())
+        self.open_group()
+        self.plugin.services.health.set_degraded(
+            plugin_module.health.Degradation.MEMORY_STORE_FAILED
+        )
+        await self.plugin.on_message(self.plain())
+        self.assertEqual(self.collected(), ())
+
+    async def test_buffer_ttl_follows_the_injected_clock(self):
+        await self.start(storage_path=self.new_storage_path())
+        self.open_group()
+        await self.plugin.on_message(self.plain())
+        self.assertEqual(len(self.collected()), 1)
+        self.clock.advance(600)
+        self.assertEqual(self.collected(), ())
+
+
+class ContextCommandTests(AssemblyTestCase):
+    """S2-04：`上下文 退出` / `上下文 加入` 的状态变更与清理（静默、不虚报）。"""
+
+    def leave(self, **overrides):
+        return self.mention("上下文 退出", **overrides)
+
+    def join(self, **overrides):
+        return self.mention("上下文 加入", **overrides)
+
+    def member(self, member_id: str = "30001"):
+        return plugin_module.MemberKey(self.group_key(), member_id)
+
+    async def start_with_storage(self, *, provider=None, cleaner=None):
+        path = self.new_storage_path()
+        await self.start(
+            provider=provider or fakes.FakeProvider(),
+            storage_path=path,
+            history_cleaner=cleaner or fakes.FakeHistoryCleaner(),
+        )
+        return path
+
+    async def test_leave_persists_clears_buffer_and_history(self):
+        provider = fakes.FakeProvider()
+        cleaner = fakes.FakeHistoryCleaner()
+        path = await self.start_with_storage(provider=provider, cleaner=cleaner)
+        self.open_group()
+        await self.plugin.on_message(self.plain("旧消息"))
+        self.assertEqual(len(self.collected()), 1)
+
+        event = self.leave()
+        await self.plugin.on_message(event)
+        self.assertTrue(self.plugin.services.storage.members.state(self.member()).opted_out)
+        self.assertEqual(self.collected(), ())
+        self.assertEqual(cleaner.calls, [event.unified_msg_origin])
+        self.assertEqual(self.sent, [])
+        self.assertEqual(provider.calls, [])
+
+        # 重启不复活。
+        reopened = plugin_module.storage.open_storage(path, clock=lambda: 0)
+        self.addCleanup(reopened.close)
+        self.assertTrue(reopened.members.state(self.member()).opted_out)
+
+    async def test_leave_only_affects_the_sender(self):
+        cleaner = fakes.FakeHistoryCleaner()
+        await self.start_with_storage(cleaner=cleaner)
+        self.open_group()
+        await self.plugin.on_message(self.plain("甲的消息", sender_id="30001", message_id="m1"))
+        await self.plugin.on_message(self.plain("乙的消息", sender_id="30002", message_id="m2"))
+        await self.plugin.on_message(self.leave(message_id="leave-1"))
+
+        self.assertTrue(self.plugin.services.storage.members.state(self.member("30001")).opted_out)
+        self.assertFalse(self.plugin.services.storage.members.state(self.member("30002")).opted_out)
+        self.assertEqual([entry.text for entry in self.collected()], ["乙的消息"])
+
+    async def test_join_needs_an_open_group_and_restores_nothing(self):
+        await self.start_with_storage()
+        await self.plugin.on_message(self.leave(message_id="leave-1"))
+        self.assertTrue(self.plugin.services.storage.members.state(self.member()).opted_out)
+
+        # 未告知/未开启：加入不生效。
+        await self.plugin.on_message(self.join(message_id="join-1"))
+        self.assertTrue(self.plugin.services.storage.members.state(self.member()).opted_out)
+
+        # 告知并开启后可以加入；旧材料不恢复。
+        self.open_group()
+        await self.plugin.on_message(self.join(message_id="join-2"))
+        self.assertFalse(self.plugin.services.storage.members.state(self.member()).opted_out)
+        self.assertEqual(self.collected(), ())
+
+    async def test_leave_then_addressed_chat_still_works(self):
+        provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="嗯，我在听。")])
+        await self.start_with_storage(provider=provider)
+        self.open_group()
+        await self.plugin.on_message(self.leave(message_id="leave-1"))
+        await self.plugin.on_message(self.mention("你好", message_id="chat-1"))
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(len(self.sent), 1)
+
+    async def test_history_failure_is_reported_without_faking_deletion(self):
+        cleaner = fakes.FakeHistoryCleaner(error=RuntimeError("delete failed"))
+        await self.start_with_storage(cleaner=cleaner)
+        self.open_group()
+        await self.plugin.on_message(self.leave())
+
+        self.assertTrue(self.plugin.services.storage.members.state(self.member()).opted_out)
+        self.assertIn(
+            plugin_module.health.Degradation.DELETION_FAILED,
+            self.plugin.services.health.degradations(),
+        )
+        self.assertEqual(self.sent, [])
+        # 删除失败后采集保持关闭（架构 §8.3）。
+        await self.plugin.on_message(self.plain("新消息", message_id="after"))
+        self.assertEqual(self.collected(), ())
+
+    async def test_storage_unavailable_is_silent_and_fails_closed(self):
+        broken = self.new_storage_path()
+        broken.write_bytes(b"not a sqlite database")
+        provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="嗯。")])
+        await self.start(provider=provider, storage_path=broken, history_cleaner=fakes.FakeHistoryCleaner())
+        self.assertIsNone(self.plugin.services.storage)
+        self.assertIn(
+            plugin_module.health.Degradation.MEMORY_STORE_FAILED,
+            self.plugin.services.health.degradations(),
+        )
+        await self.plugin.on_message(self.leave())
+        self.assertEqual(self.sent, [])
+        self.assertEqual(provider.calls, [])
+
+        # 聊天不依赖存储：退出/加入不可用不影响正常 @ 回复。
+        await self.plugin.on_message(self.mention("你好", message_id="chat-1"))
+        self.assertEqual(len(self.sent), 1)
+
+    async def test_duplicate_event_runs_once(self):
+        cleaner = fakes.FakeHistoryCleaner()
+        await self.start_with_storage(cleaner=cleaner)
+        self.open_group()
+        await self.plugin.on_message(self.leave(message_id="same"))
+        await self.plugin.on_message(self.leave(message_id="same"))
+        self.assertEqual(len(cleaner.calls), 1)
+
+    async def test_out_of_scope_events_change_nothing(self):
+        await self.start_with_storage()
+        self.open_group()
+        cases = (
+            ("私聊", {"private": True}),
+            ("未允许群", {"group_id": "20002"}),
+            ("机器人自身消息", {"sender_id": "10001"}),
+        )
+        for index, (name, overrides) in enumerate(cases):
+            with self.subTest(case=name):
+                await self.plugin.on_message(self.leave(message_id=f"m{index}", **overrides))
+        self.assertFalse(self.plugin.services.storage.members.state(self.member()).opted_out)
+        self.assertFalse(
+            self.plugin.services.storage.members.state(
+                plugin_module.MemberKey(self.group_key("20002"), "30001")
+            ).opted_out
+        )
+        self.assertEqual(self.sent, [])
 
 
 if __name__ == "__main__":

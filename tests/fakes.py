@@ -209,6 +209,23 @@ class FakeContext:
         return self._platform
 
 
+class FakeHistoryCleaner:
+    """替换插件的群历史清理器：记录收到的 umo，可注入异常模拟删除失败。
+
+    真实实现走 `context.conversation_manager.delete_conversations_by_user_id`（K9），
+    在离线环境会触真框架库；装配级测试一律注入本替身。
+    """
+
+    def __init__(self, *, error: BaseException | None = None) -> None:
+        self.calls: list[str] = []
+        self.error = error
+
+    async def __call__(self, umo: str) -> None:
+        self.calls.append(umo)
+        if self.error is not None:
+            raise self.error
+
+
 def make_config(path: Path, **values: object) -> object:
     """按真实 `_conf_schema.json` 构造插件配置，并覆盖给定键。需先完成框架引导。"""
     import json
@@ -238,7 +255,18 @@ class EventFactory:
         sender_id: str = "30001",
     ) -> None:
         from astrbot.api.event import AstrMessageEvent
-        from astrbot.api.message_components import At, AtAll, File, Image, Plain, Record, Reply, Video
+        from astrbot.api.message_components import (
+            At,
+            AtAll,
+            File,
+            Forward,
+            Image,
+            Nodes,
+            Plain,
+            Record,
+            Reply,
+            Video,
+        )
         from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
         from astrbot.core.platform.message_type import MessageType
         from astrbot.core.platform.platform_metadata import PlatformMetadata
@@ -252,6 +280,8 @@ class EventFactory:
         self.AtAll = AtAll
         self.Plain = Plain
         self.Reply = Reply
+        self.Forward = Forward
+        self.Nodes = Nodes
         self.Image = Image
         self.Record = Record
         self.Video = Video
