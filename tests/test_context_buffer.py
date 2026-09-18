@@ -55,6 +55,7 @@ class BufferTestCase(unittest.TestCase):
         member_id: str = "30001",
         group_id: str = "20001",
         shape: BufferShape = BufferShape.TEXT_ONLY,
+        nickname: str = "",
     ) -> IngestOutcome:
         return self.buffer.ingest(
             group=make_group(group_id),
@@ -62,6 +63,7 @@ class BufferTestCase(unittest.TestCase):
             message_id=message_id,
             text=text,
             shape=shape,
+            nickname=nickname,
         )
 
 
@@ -305,6 +307,47 @@ class ConstructorTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs):
                 with self.assertRaises(ValueError):
                     ContextBuffer(clock=clock, **kwargs)
+
+
+class NicknameTests(BufferTestCase):
+    """昵称只随条目暂存供展示：不进任何键、不参与判定、不进 ``repr``。"""
+
+    def test_nickname_is_stored_verbatim(self):
+        self.ingest(nickname="小\n明")
+        entry = self.buffer.entries(make_group())[0]
+        self.assertEqual(entry.nickname, "小\n明")
+
+    def test_nickname_defaults_to_empty(self):
+        self.ingest()
+        self.assertEqual(self.buffer.entries(make_group())[0].nickname, "")
+
+    def test_non_string_nickname_is_dropped(self):
+        for value in (None, 42, ["小明"]):
+            with self.subTest(value=value):
+                self.buffer.clear_all()
+                self.ingest(message_id="m-nick", nickname=value)
+                self.assertEqual(self.buffer.entries(make_group())[0].nickname, "")
+
+    def test_identity_does_not_depend_on_nickname(self):
+        self.ingest(text="第一条", message_id="m1", member_id="30001", nickname="同名")
+        self.ingest(text="第二条", message_id="m2", member_id="30002", nickname="同名")
+        entries = self.buffer.entries(make_group())
+        self.assertEqual([entry.member_id for entry in entries], ["30001", "30002"])
+
+    def test_nickname_stays_out_of_repr(self):
+        entry = BufferEntry(
+            member_id="30001",
+            message_id="m1",
+            text="正文",
+            at=1.0,
+            nickname="不该出现的昵称",
+        )
+        self.assertNotIn("不该出现的昵称", repr(entry))
+
+    def test_clearing_a_member_drops_their_nickname_too(self):
+        self.ingest(member_id="30001", nickname="小明")
+        self.buffer.clear_member(make_member("30001"))
+        self.assertEqual(self.buffer.entries(make_group()), ())
 
 
 class StructuralTests(unittest.TestCase):

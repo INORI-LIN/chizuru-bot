@@ -79,12 +79,17 @@ class IngestOutcome(StrEnum):
 
 @dataclass(frozen=True)
 class BufferEntry:
-    """一条缓冲消息。正文不进 ``repr``（与 ``MessageFacts.direct_text`` 同例）。"""
+    """一条缓冲消息。正文与昵称不进 ``repr``（与 ``MessageFacts.direct_text`` 同例）。
+
+    ``nickname`` 只用于展示：它不进任何键，也不参与身份判定；转义与限长在渲染侧
+    （``context_assembly.escape_nickname``）完成，本模块存原文（只在内存，随条目清理）。
+    """
 
     member_id: str
     message_id: str
     text: str = field(repr=False)
     at: float
+    nickname: str = field(default="", repr=False)
 
 
 @dataclass(frozen=True)
@@ -135,8 +140,12 @@ class ContextBuffer:
         message_id: str,
         text: str,
         shape: BufferShape,
+        nickname: str = "",
     ) -> IngestOutcome:
-        """尝试写入一条普通群聊；返回未保存的确定原因，调用方无需再判一遍。"""
+        """尝试写入一条普通群聊；返回未保存的确定原因，调用方无需再判一遍。
+
+        ``nickname`` 只随条目暂存供展示；它不是键、不参与任何判定，缺省为空。
+        """
         if member.group != group:
             raise ValueError("member 必须属于 group")
         if not isinstance(message_id, str) or not message_id:
@@ -163,7 +172,15 @@ class ContextBuffer:
         else:
             entries = deque()
             self._groups[group] = entries
-        entries.append(BufferEntry(member_id=member.member_id, message_id=message_id, text=text, at=now))
+        entries.append(
+            BufferEntry(
+                member_id=member.member_id,
+                message_id=message_id,
+                text=text,
+                at=now,
+                nickname=nickname if isinstance(nickname, str) else "",
+            )
+        )
         while len(entries) > self._max:
             entries.popleft()
             self._evicted_capacity += 1

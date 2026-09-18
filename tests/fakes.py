@@ -226,6 +226,36 @@ class FakeHistoryCleaner:
             raise self.error
 
 
+class FakeHistoryStore:
+    """替换插件的互动历史存储（S2-07）：内存原文，可注入读写异常。
+
+    真实实现走 `context.conversation_manager` 的会话接口；离线环境里那会触真框架库，
+    装配级测试一律注入本替身。`load` 返回会话存储里的 JSON 原文（`None` = 无会话），
+    `save` 记录写回的条列表。
+    """
+
+    def __init__(self, *, raw: str | None = None, load_error: BaseException | None = None, save_error: BaseException | None = None) -> None:
+        self.raw = raw
+        self.load_calls: list[str] = []
+        self.saves: list[tuple[str, tuple[dict, ...]]] = []
+        self.load_error = load_error
+        self.save_error = save_error
+
+    async def load(self, umo: str) -> str | None:
+        self.load_calls.append(umo)
+        if self.load_error is not None:
+            raise self.load_error
+        return self.raw
+
+    async def save(self, umo: str, entries: tuple[dict, ...]) -> None:
+        self.saves.append((umo, tuple(entries)))
+        if self.save_error is not None:
+            raise self.save_error
+        import json
+
+        self.raw = json.dumps(list(entries))
+
+
 def make_config(path: Path, **values: object) -> object:
     """按真实 `_conf_schema.json` 构造插件配置，并覆盖给定键。需先完成框架引导。"""
     import json

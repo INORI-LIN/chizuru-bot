@@ -6,13 +6,15 @@
 
 装配顺序（与架构 §4.3 一致）：
 
-    分类 → 指令解析 → 授权 → 去重 begin → 预算 reserve → 调度 submit → 模型调用
-      → 预算 settle → 发送门控 evaluate → event.send → 去重 finish
+    分类 → 指令解析 → 授权 → 去重 begin → 装配（材料/历史/修订快照）→ 预算 reserve
+      → 调度 submit → 模型调用 → 预算 settle → 发送门控 evaluate → event.send
+      → 写回合格历史 → 去重 finish
 
 **配对规则**（决定条目与额度的去向）：
 
 | 结果 | dedup | budget |
 |---|---|---|
+| 装配拒绝（固定规则 + 当前输入超预算） | `release` | 未预留 |
 | 队列满 / 等待超时 / 调度器已关闭（从未开始） | `release` | `cancel` |
 | 预算拒绝、提供商不可用、message_id 不可用 | `release` | 未预留 |
 | 超业务期限（已开始，无结果） | `finish(COMPLETED)` | `settle(None)` 按估算 |
@@ -29,6 +31,11 @@
   让聊天静默停摆。聊天不要求告知，采集才要求。
 - 普通群聊采集（S2-03）与 `上下文 退出/加入`（S2-04）已接线；采集准入读持久化群策略
   （**无行即关闭**），因此 S2-02/S2-05 落地前生产环境实际不采集、暂停/关闭命令也不存在。
+- 动态材料与互动历史（S2-06/S2-07）已接入请求：材料只落 `extra_user_content_parts` 并
+  标记为临时，历史只落 `contexts`；两者都经同一 token 预算裁剪，**结构上不进 system**。
+  超预算时不调模型、不发送、静默（超长提示文案属附录 C 待审范围）。
+- 互动历史写回只在**送达成功**后进行，且写前重读群/成员修订号；写失败只记审计，
+  不影响已送达的回复、不置持久降级（历史不是聊天的前置条件）。
 - 存储路径来自 AstrBot 插件数据目录，**延迟建库**（不写不建文件）；解析或打开失败即
   降级为"无存储"，采集与退出/加入保持关闭，`千鹤 状态` 可见。
 - 去重窗口与容量是装配层常量，标注"建议参数待评审"——取值依赖仍未在线核验的 O-07。
@@ -51,7 +58,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Awaitable, Callable, Sequence
+from typing import Awaitable, Callable, Mapping, Sequence
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -67,15 +74,16 @@ from astrbot.api.message_components import (
     Video,
 )
 from astrbot.api.star import Context, Star, StarTools
+from astrbot.core.agent.message import TextPart
 from astrbot.core.platform.message_type import MessageType
 
-from . import commands, context_assembly, health, llm, redact, storage
+from . import commands, context_assembly, health, history, llm, redact, storage
 from .budget import BudgetLedger, BudgetRefusal, BudgetRefused, PriceTable, Reservation, UsageKind
 from .config import Settings
 from .context_buffer import BufferShape, ContextBuffer, IngestOutcome
 from .control import authorize
 from .dedup import ActionKind, Claim, DedupKey, DedupStore, Outcome
-from .keys import BotInstanceKey, GroupKey, MemberKey
+from .keys import BotInstanceKey, GroupKey, MemberKey, RevisionSnapshot
 from .policy import Classification, MessageFacts, classify, is_trusted_scope
 from .scheduler import AdmissionRefused, Deadline, DeadlineExceeded, Scheduler
 from .send_gate import (
@@ -117,6 +125,47 @@ class _Services:
     context_buffer: ContextBuffer
 
 
+@dataclass(frozen=True)
+class _ChatPreparation:
+    """一次聊天的装配结果：请求形态与发起时的数据修订号快照。"""
+
+    plan: llm.LLMRequestPlan
+    revision: RevisionSnapshot | None
+
+
+class _ConversationHistory:
+    """把 AstrBot 会话存储适配成 `history` 模块要的两件事：读原文、写条列表。
+
+    不做业务判断（筛选取严、轮数上限、私有键剥离都在 `history.py`），也不做补救：
+    任何失败由调用方降级为"无历史"。**懒解析** `context` 属性，构造与 `initialize()`
+    都不触碰框架上下文。
+    """
+
+    def __init__(self, context: Context) -> None:
+        self._context = context
+
+    def _manager(self) -> object:
+        return self._context.conversation_manager
+
+    async def load(self, umo: str) -> str | None:
+        """读会话存储的 JSON 原文；没有会话就不是"空历史"而是"没有历史"。"""
+        manager = self._manager()
+        conversation_id = await manager.get_curr_conversation_id(umo)
+        if not conversation_id:
+            return None
+        conversation = await manager.get_conversation(umo, conversation_id)
+        raw = getattr(conversation, "history", None)
+        return raw if isinstance(raw, str) else None
+
+    async def save(self, umo: str, entries: Sequence[Mapping[str, object]]) -> None:
+        """整体写回（含裁剪结果）；没有会话时先建一个再写。"""
+        manager = self._manager()
+        conversation_id = await manager.get_curr_conversation_id(umo)
+        if not conversation_id:
+            conversation_id = await manager.new_conversation(umo)
+        await manager.update_conversation(umo, conversation_id=conversation_id, history=list(entries))
+
+
 class ChizuruPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
@@ -128,6 +177,8 @@ class ChizuruPlugin(Star):
         self.redactor_salt: bytes | None = None
         self.storage_path: Path | None = None
         self.history_cleaner: Callable[[str], Awaitable[None]] | None = None
+        self.history_store: object | None = None
+        """互动历史存储（S2-07）的测试注入点；默认用 `_ConversationHistory(context)`。"""
 
     # ---- 生命周期 ----
 
@@ -317,7 +368,15 @@ class ChizuruPlugin(Star):
             message_id=message_id,
             text=facts.direct_text,
             shape=shape,
+            nickname=self._sender_nickname(event),
         )
+
+    @staticmethod
+    def _sender_nickname(event: AstrMessageEvent) -> str:
+        """事件里的昵称，**只用于展示**：不进键、不参与任何判定（需求 §5.3、架构 §2.2）。"""
+        sender = getattr(event.message_obj, "sender", None)
+        value = getattr(sender, "nickname", "")
+        return value if isinstance(value, str) else ""
 
     @staticmethod
     def _buffer_shape(chain: Sequence[object]) -> BufferShape:
@@ -357,6 +416,13 @@ class ChizuruPlugin(Star):
             self._audit(services, redact.EventCategory.IGNORED)
             return
 
+        prepared = await self._prepare_chat(event, facts, settings, services, message_id)
+        if prepared is None:
+            # 固定规则 + 当前输入已超预算：不预留、不调用、不发送（提示文案属附录 C 待审范围）。
+            services.dedup.release(key)
+            self._audit(services, redact.EventCategory.MODEL_CALL, code=redact.ErrorCode.REQUEST_INVALID)
+            return
+
         provider = await self._acquire_provider(event, services, facts, message_id)
         if provider is None:
             services.dedup.release(key)
@@ -369,7 +435,7 @@ class ChizuruPlugin(Star):
         try:
             answer = await services.scheduler.submit_chat(
                 group,
-                lambda deadline: self._ask(provider, facts, settings, services, deadline),
+                lambda deadline: self._ask(provider, prepared.plan, settings, services, deadline),
             )
         except AdmissionRefused:
             # 从未开始：额度可退，事件可重来（重连回放不该被永久判为已处理）。
@@ -399,7 +465,7 @@ class ChizuruPlugin(Star):
             services.dedup.finish(key, Outcome.COMPLETED)
             return
 
-        outcome = await self._deliver(
+        outcome, sent = await self._deliver(
             event,
             facts,
             settings,
@@ -408,22 +474,151 @@ class ChizuruPlugin(Star):
             answer.text,
             kind=SendKind.CHAT,
             llm_invoked=True,
+            revision=prepared.revision,
         )
+        if history.should_record(memory_assisted=False, delivered=sent):
+            # `memory_assisted` 本批恒 False；S3-08 起为"本轮检索到长期记忆"。
+            await self._record_history(event, facts, settings, services, answer.text, prepared.revision)
         services.dedup.finish(key, outcome)
+
+    async def _prepare_chat(
+        self,
+        event: AstrMessageEvent,
+        facts: MessageFacts,
+        settings: Settings,
+        services: _Services,
+        message_id: str,
+    ) -> _ChatPreparation | None:
+        """装配一次聊天请求：动态材料 + 合格历史 + 修订号快照；超预算返回 `None`。
+
+        材料来自内存缓冲（同一事件已按 message_id 排除），历史来自会话存储并已按
+        轮数/TTL 筛选；两者都经同一 token 预算裁剪（架构 §5.2）。**材料只进
+        `extra_user_content_parts` 并标记为临时，历史只进 `contexts`，都不进 system。**
+        """
+        group = self._group_key(facts)
+        materials = context_assembly.render_materials(
+            services.context_buffer.entries(group),
+            exclude_message_id=message_id,
+            current_member_id=facts.sender_id,
+            current_nickname=self._sender_nickname(event),
+            now_monotonic=self.clock(),
+            now_wall=self.datetime_clock(),
+        )
+        trimmed = context_assembly.trim_to_budget(
+            system_prompt=context_assembly.system_prompt(),
+            user_text=facts.direct_text,
+            materials=materials,
+            history_turns=await self._load_history(event, settings, services),
+            budget=settings.budget.input_token_budget,
+        )
+        if trimmed is None:
+            return None
+        parts: tuple[object, ...] = ()
+        if trimmed.materials is not None:
+            # part 级临时标记（K6）：框架若把这一轮交给持久化，注入片段会被剔除。
+            parts = (TextPart(text=trimmed.materials).mark_as_temp(),)
+        plan = context_assembly.build_chat_plan(
+            user_text=facts.direct_text,
+            max_retries=settings.limits.max_retries,
+            dynamic_parts=parts,
+            contexts=trimmed.contexts,
+        )
+        return _ChatPreparation(plan=plan, revision=self._revision_snapshot(services, group, facts.sender_id))
+
+    async def _load_history(
+        self,
+        event: AstrMessageEvent,
+        settings: Settings,
+        services: _Services,
+    ) -> tuple[history.Turn, ...]:
+        """读会话存储并筛出有效期内的最近轮次；**任何失败都降级为"无历史"**。
+
+        历史只影响多轮体验，不是聊天的前置条件：读失败不置持久降级、不影响出站。
+        """
+        store = self._history()
+        try:
+            raw = await store.load(event.unified_msg_origin)
+        except Exception:
+            self._audit(services, redact.EventCategory.CONTEXT_OP, code=redact.ErrorCode.UNCLASSIFIED)
+            return ()
+        return history.select(
+            history.parse(raw),
+            max_turns=settings.context.history_max_turns,
+            ttl_seconds=settings.context.history_ttl_hours * 3600,
+            now_epoch=self._now_epoch(),
+        )
+
+    async def _record_history(
+        self,
+        event: AstrMessageEvent,
+        facts: MessageFacts,
+        settings: Settings,
+        services: _Services,
+        answer_text: str,
+        revision: RevisionSnapshot | None,
+    ) -> None:
+        """把已送达的一轮写回会话存储（S2-07）：**写前重读修订号，退出/清空后不复活**。
+
+        只写普通问答：控制命令与记忆辅助轮根本不进这个函数（架构 §4.4、需求 §4.3）。
+        任何失败只记审计——已发送的回复不受影响，历史也不是聊天的前置条件。
+        """
+        if revision is not None and self._revision_snapshot(services, self._group_key(facts), facts.sender_id) != revision:
+            return
+        store = self._history()
+        try:
+            raw = await store.load(event.unified_msg_origin)
+            turns = history.parse(raw) + (
+                history.make_turn(
+                    user_text=facts.direct_text,
+                    assistant_text=answer_text,
+                    at_epoch=self._now_epoch(),
+                ),
+            )
+            qualified = history.select(
+                turns,
+                max_turns=settings.context.history_max_turns,
+                ttl_seconds=settings.context.history_ttl_hours * 3600,
+                now_epoch=self._now_epoch(),
+            )
+            await store.save(event.unified_msg_origin, history.storage_entries(qualified))
+        except Exception:
+            self._audit(services, redact.EventCategory.CONTEXT_OP, code=redact.ErrorCode.UNCLASSIFIED)
+            return
+        self._audit(services, redact.EventCategory.CONTEXT_OP)
+
+    def _history(self) -> object:
+        """互动历史存储：测试注入 `history_store`，生产用框架会话存储（懒解析 context）。"""
+        if self.history_store is not None:
+            return self.history_store
+        return _ConversationHistory(self.context)
+
+    def _revision_snapshot(
+        self,
+        services: _Services,
+        group: GroupKey,
+        member_id: str,
+    ) -> RevisionSnapshot | None:
+        """读群与成员修订号；无存储或读失败返回 `None`（无法比对 ≠ 已变更）。"""
+        stored = services.storage
+        if stored is None or stored.database.failed:
+            return None
+        try:
+            return RevisionSnapshot(
+                group_revision=stored.groups.policy(group).revision,
+                member_revision=stored.members.state(MemberKey(group, member_id)).revision,
+            )
+        except storage.StorageFailure:
+            return None
 
     async def _ask(
         self,
         provider: object,
-        facts: MessageFacts,
+        plan: llm.LLMRequestPlan,
         settings: Settings,
         services: _Services,
         deadline: Deadline,
     ) -> llm.Answer:
         """一次聊天请求：直接调用提供商，最多重试 1 次且**共用同一个期限**。"""
-        plan = context_assembly.build_chat_plan(
-            user_text=facts.direct_text,
-            max_retries=settings.limits.max_retries,
-        )
         policy = llm.RetryPolicy.from_limits(settings.limits)
         attempt = 0
         while True:
@@ -532,7 +727,7 @@ class ChizuruPlugin(Star):
         report = "\n".join(
             health.format_report(snapshot, configured=settings.identity_configured)
         )
-        outcome = await self._deliver(
+        outcome, _ = await self._deliver(
             event,
             facts,
             settings,
@@ -667,23 +862,32 @@ class ChizuruPlugin(Star):
         *,
         kind: SendKind,
         llm_invoked: bool,
-    ) -> Outcome:
-        """发送前复核后出站。这是本插件唯一调用 `event.send` 的地方。"""
+        revision: RevisionSnapshot | None = None,
+    ) -> tuple[Outcome, bool]:
+        """发送前复核后出站。这是本插件唯一调用 `event.send` 的地方。
+
+        返回 ``(去重结论, 是否已送出)``：门控丢弃与发送成功在去重里同为 ``COMPLETED``，
+        但只有真的送出才允许写回互动历史。`revision` 是发起工作时的修订号快照：非 `None`
+        时在发送前重读一次，退出/暂停/授权变更发生后丢弃在途结果（架构 §6.2）。
+        """
         request = SendRequest(
             kind=kind,
             source=facts,
             target=group,
-            revision=None,
+            revision=revision,
             llm_invoked=llm_invoked,
         )
+        current = None
+        if revision is not None:
+            current = self._revision_snapshot(services, group, facts.sender_id)
         gate = evaluate(
             request,
             settings,
-            GateFacts(group_state=self._group_state(settings, facts), current=None, previous=None),
+            GateFacts(group_state=self._group_state(settings, facts), current=current, previous=None),
         )
         if not gate.allowed:
             self._audit(services, redact.EventCategory.GATE_DROP, code=_drop_code(gate.drop))
-            return Outcome.COMPLETED
+            return Outcome.COMPLETED, False
 
         started = self.clock()
         try:
@@ -695,13 +899,13 @@ class ChizuruPlugin(Star):
                 redact.EventCategory.SEND_RESULT,
                 duration_ms=max(0, int((self.clock() - started) * 1000)),
             )
-            return Outcome.SEND_UNCERTAIN
+            return Outcome.SEND_UNCERTAIN, False
         self._audit(
             services,
             redact.EventCategory.SEND_RESULT,
             duration_ms=max(0, int((self.clock() - started) * 1000)),
         )
-        return Outcome.COMPLETED
+        return Outcome.COMPLETED, True
 
     # ---- 小工具 ----
 
