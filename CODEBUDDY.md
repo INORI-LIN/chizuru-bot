@@ -16,7 +16,7 @@ This file provides guidance to CodeBuddy Code when working with code in this rep
 （`storage/`、`context_buffer.py`、`context_assembly.py` 动态材料、`history.py`、`notice.py`
 告知两步开启与维护者命令、清理覆盖与启动裁剪、`main.py` 接线）；**`S2-02`/`S2-05` 的前置已由维护者确认**
 （2026-09-18：维护者清单与目标群已定，值只进运行时配置；附录 C.1 告知文案定稿），
-只剩 `S2-10` 阶段门，而它**仍不可能通过**（S1 门未过、无在线证据）；S3、S4 未开始。
+`S2-10` 阶段门的**门禁记录已产出（docs/03 附录 F）且结论为未通过**（S1 门未过、无在线证据；G03 的记忆辅助整轮与 G04 的 A09/A10 属 S3），**S2 不得宣称完成、S3 入口仍不成立**；S3、S4 未开始。
 **生产环境采集默认关闭**：需维护者在运行时配置里填入允许群与维护者并完成一次两步开启。
 
 | 文档 | 角色 |
