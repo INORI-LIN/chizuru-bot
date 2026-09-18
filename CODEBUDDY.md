@@ -10,8 +10,8 @@ This file provides guidance to CodeBuddy Code when working with code in this rep
 以《租借女友》水原千鹤为人设参考。**非官方、仅被 @ 时回复、不主动接话**。
 
 **当前状态：未上线。** S0 离线核验完成，但 **S0 阶段门于 2026-09-17 被维护者决定有意跳过（不是通过）**，
-在线部分（真实 QQ/NapCat/DeepSeek）从未验证。S1 进行中：`S1-01/02/03/04/05/06/07/08/09/12/13` 已完成，
-`S1-10`、`S1-11`、`S1-14`—`S1-16` 未开始；S2/S3/S4 未开始。
+在线部分（真实 QQ/NapCat/DeepSeek）从未验证。S1 进行中：`S1-01/02/03/04/05/06/07/08/09/12/13` 与
+`S1-10`（**仅离线部分**）已完成，`S1-11`、`S1-14`—`S1-16` 未开始；S2/S3/S4 未开始。
 
 | 文档 | 角色 |
 |---|---|
@@ -29,7 +29,7 @@ export ASTRBOT_BUILD_DASHBOARD=0   # 阻止上游构建钩子运行 npm
 ```
 
 ```sh
-# 全量离线核验：6 个 S0 核验脚本 + 全部单元测试（当前共 237 项单元测试）
+# 全量离线核验：7 个核验脚本 + 全部单元测试（当前共 282 项单元测试）
 bash scripts/s0/run_all.sh
 
 # 只跑全部单元测试
@@ -44,7 +44,7 @@ env -u VIRTUAL_ENV uv run --project "$PWD/.runtime/astrbot" --no-sync --offline 
 env -u VIRTUAL_ENV uv run --project "$PWD/.runtime/astrbot" --no-sync --offline \
     python -B -m unittest discover -s "$PWD/tests" -k test_extraction_stops_before_chat -v
 
-# 单个 S0 核验脚本（check_env / check_outbound / check_gating / check_collect / check_temp / check_history）
+# 单个核验脚本（check_env / check_outbound / check_gating / check_collect / check_temp / check_history / check_single_call）
 env -u VIRTUAL_ENV uv run --project "$PWD/.runtime/astrbot" --no-sync --offline \
     python -B scripts/s0/check_gating.py
 ```
@@ -83,7 +83,7 @@ OneBot 事件 → main.py（唯一框架入口、薄适配，提取 MessageFacts
   → commands.parse（指令 / 聊天分流）
   → control.authorize（确定性权限判定；只来自可信身份 + 显式配置）
   → dedup.begin（事件与动作去重）→ budget.reserve（先预留）→ scheduler.submit（准入）
-  → llm.py（S1-10，未实现）→ send_gate.evaluate（S1-12，已实现）→ 唯一出站路径
+  → llm.py（S1-10 离线部分，直接调用原生提供商）→ send_gate.evaluate（S1-12）→ 唯一出站路径
 ```
 
 ### 模块边界（每个模块"必须不做"与职责同等重要）
@@ -102,9 +102,9 @@ OneBot 事件 → main.py（唯一框架入口、薄适配，提取 MessageFacts
 | `health.py` | 平台状态归一化（只认 `Platform.status` 四个取值，其余落 `UNKNOWN`）、持久降级标志、抽取失败计数、供维护者查询的快照与文本 | 不导入框架、不探测、不发送；**不表示 QQ 登录态**（报告固定输出"未知"）；不读 `instance.config`（含 token）与任何错误文本/堆栈 |
 | `send_gate.py` | 出站前复核：源范围 → 源触发形态 → 目标群一致 → 群开关 → 修订号 → 发送不确定；不一致即丢弃 | 不发送、不调模型、不做补救；**群开关与修订号由调用方注入**（无默认值）；不提供任何回执/送达 API；固定提示构造时即禁止模型调用 |
 | `redact.py` | 类别化日志记录（`AuditRecord` 无自由文本字段）、错误码闭集、每进程加盐的关联标识、保留期与大小策略、AstrBot/NapCat 日志审计清单 | 不做日志 IO、不轮转文件（`logging` 都不导入）；不记正文/请求体/密钥/推理文本；关联摘要不可还原、跨重启不可关联（刻意取舍） |
+| `llm.py` | 请求成形（`LLMRequestPlan`，键集固定、无工具参数）、回复解释（只读 `role`/`completion_text`）、错误分类（状态码委托 `redact.ErrorCode`）、≤1 次重试判定（共用同一 `Deadline`）、usage 映射、`FollowUp` 类别 | 不发送、不导入框架、不建网关/客户端；不组装人格与上下文（S1-11）；不读写历史与存储；**不读取推理字段、不追加工具**；不含任何群内文案；**在线部分未验证**（真实 401/402/429/5xx 与 usage 仍待 S0-07） |
 
-**尚不存在**（属后续任务卡，不要 import）：`llm.py`（S1-10）、`context_assembly.py`（S1-11）、
-`storage/`、`memory/`。
+**尚不存在**（属后续任务卡，不要 import）：`context_assembly.py`（S1-11）、`storage/`、`memory/`。
 docs/03 §3.2 的目录树是**拟议结构**，不是现状清单——判断某文件是否存在请直接看仓库。
 
 ### 不可违背的硬约束
@@ -124,8 +124,11 @@ docs/03 §3.2 的目录树是**拟议结构**，不是现状清单——判断�
 
 ### 易错点（已核验的上游行为，逐条有源码位置，见 docs/03 §3.4）
 
-- K1：任一 handler 的 filter 通过即使事件 `is_wake = True`——宽 filter 有副作用，须用
-  `should_call_llm(False)` + `stop_event()` 收口。
+- K1：任一 handler 的 filter 通过即使事件 `is_wake = True`——宽 filter 有副作用，须显式收口。
+  收口默认 LLM 链路要用 **`should_call_llm(True)`**：`call_llm` 初值为 `False`，第二路径的门槛是
+  `not event.call_llm`（K5 已于 2026-09-18 修正，原表述写反）；需要交给框架送出的回复不能
+  `stop_event()`，否则回复也不会发出。**本插件的模型调用不走 `event.request_llm`**：按附录 D.2
+  直调原生提供商（K14）。
 - K3：私聊默认唤醒；K4：`ProcessStage` 在 handler 之后还有**第二条默认 LLM 路径**（同一事件可能双次计费）。
 - K6：`mark_as_temp()` 只作用于 part，整轮排除还须在 `on_agent_done` 对 user 与 assistant
   两条 `Message` 设 `_no_save`。

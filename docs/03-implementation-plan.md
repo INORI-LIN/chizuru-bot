@@ -1,6 +1,6 @@
 # 千鹤 QQ 群聊天机器人：实施拆分与任务卡
 
-- 文档版本：0.12
+- 文档版本：0.13
 - 日期：2026-09-18
 - 阶段：实施拆分（规划）。本表所列编码、脚本、配置与联调**均未开始**；本文只是规划产物
 - 需求依据：[需求拆分](./01-requirements.md)
@@ -22,6 +22,7 @@
 | 0.10 | 2026-09-17 | S1-06 完成**授权决策**部分，`control.py` 新增；"执行状态变更与修订号"经查属本地持久化，移出本任务至 S2-01/S2-08（§5.2 记录判据拆分）；`tests/test_control.py` 18 项；回归共 95 项通过。顺带修正 S1-14 判据中过期的测试数量 |
 | 0.11 | 2026-09-17 | S1-07、S1-08、S1-09 完成：新增 `scheduler.py`、`dedup.py`、`budget.py`；`tests/test_scheduler.py` 17 项、`tests/test_dedup.py` 14 项、`tests/test_budget.py` 19 项；回归共 145 项通过。§5.2 记录三处实施判断（去重窗口注入、抽取停用阈值、预算与调度解耦） |
 | 0.12 | 2026-09-18 | S1-04、S1-12、S1-13 完成：新增 `health.py`、`send_gate.py`、`redact.py`；`tests/test_health.py` 29 项、`tests/test_send_gate.py` 28 项、`tests/test_redact.py` 35 项；回归共 237 项通过。§5.2 记录七处实施判断；§8 更新 R2 并新增 R17、R18。三张卡的判据均只有离线部分成立，在线验证仍待账号与凭据 |
+| 0.13 | 2026-09-18 | S1-10 **离线部分**完成并经用户批准拆分判据：新增 `llm.py`、`tests/test_llm.py` 45 项、`scripts/s0/check_single_call.py` 24 项离线核验（已接入 `run_all.sh`）；回归共 282 项通过。调用路径定为**直调提供商**（附录 D.2 的既定前提）；**修正 K5**（`should_call_llm` 语义原文写反）、新增 **K14**，附录 D.2 补充该键的双重含义，§8 新增 **R19**。S0-07 与 S1-10 的在线部分仍【阻塞·凭据】 |
 
 ## 0. 状态标记与文档约定
 
@@ -160,7 +161,7 @@ scripts/               【新增目录】S0 核验脚本；不属于产品插件
 
 | 模块 | 职责边界 | 必须不做 | R-* | 与现有关系 |
 |---|---|---|---|---|
-| `main.py` | Star 生命周期；注册 `on_message`、`on_llm_request`、`on_llm_response`、`on_decorating_result`、`after_message_sent`；装配服务；把分类结果分派到缓冲/命令/聊天/空@ | 不写业务规则；不直接 `event.send`；不放行未经门控的出站；不解析身份 | 全部 | **扩展**现有 `on_message` / `classify_event`，保留"先停止再分类"姿态 |
+| `main.py` | Star 生命周期；注册 `on_message`、`on_decorating_result`、`after_message_sent`；装配服务；把分类结果分派到缓冲/命令/聊天/空@ | 不写业务规则；不直接 `event.send`；不放行未经门控的出站；不解析身份；**不使用 `event.request_llm`**（模型调用走直调提供商，见 §5.2 S1-10 实施判断） | 全部 | **扩展**现有 `on_message` / `classify_event`，保留"先停止再分类"姿态 |
 | `config.py` | 扩展 `Settings`：群策略默认、窗口/TTL、告知与授权版本、预算占位、维护者映射；保持"畸形即整体拒绝" | 不默认开启任何采集或记忆；不把密钥放进 dataclass repr；不读取昵称 | R-ENV、R-DATA、R-OPS、R-MEM | **扩展**现有 `Settings` / `is_qq_id`，保留 `Settings()` 全空即拒绝语义 |
 | `policy.py` | 纯函数：判定**触发形态**——`IGNORE` / `EMPTY_OR_UNSUPPORTED` / `UNSUPPORTED_ATTACHMENT` / `TEXT_CANDIDATE`；判定真实 At、AtAll、Reply 排除 | 不做权限判定；不读数据库；不做发送决定；**不判采集资格**（属 S2）；**不分流指令与聊天**（属 `commands.py`） | R-TRG、R-CTX、R-CTRL | **扩展** `Classification` 与 `classify`，现有 8 项策略测试原样通过 |
 | `keys.py` | `BotInstanceKey` / `GroupKey` / `MemberKey`（平台实例 + self_id + 群 + 成员）；`RevisionSnapshot` | 不用昵称或群名构造键；不拼接外部文本 | R-DATA、R-CTX、R-MEM | 从 `policy.MessageFacts.member_key` 抽出并补群键，保留原属性 |
@@ -168,13 +169,13 @@ scripts/               【新增目录】S0 核验脚本；不属于产品插件
 | `control.py` | 按可信事件身份 + 显式配置映射判权限；**不**读事件对象、不导入框架、不调模型，只接受已提取的事实 | 不做状态变更（S2-01/S2-08）；不让 LLM 参与；不代他人开启记忆；不展示他人信息 | R-CTRL、R-ADM、R-DATA | 新增 |
 | `context_buffer.py` | 内存环形缓冲：30 条与 10 分钟取严；退出/暂停/关闭即清；排除自身输出、命令、媒体、合并转发、可识别引用；过滤明显敏感文本 | 不落盘；不请求模型；不发消息；不采集未告知群 | R-CTX、R-DATA | 新增 |
 | `context_assembly.py` | 组装临时动态材料（群缓冲、本人记忆、时间、短标签）；本地稳定 ID → 标签映射；同事件去重；token 预算裁剪；临时标记 | 不写入 system 角色；不写永久历史；不把账号 ID 原样发给模型 | R-CTX、R-CHAT、R-PER、R-DATA | 新增 |
-| `llm.py` | 取原生提供商、发起请求、解析回复、错误分类与有限重试 | 不新建网关或客户端服务；不开放工具；不外发推理字段；不把堆栈返回群 | R-CHAT、R-OPS | 新增 |
+| `llm.py` | 请求成形（`LLMRequestPlan`，键集固定、无工具参数）、回复解释（只读 `role`/`completion_text`）、错误分类（状态码委托 `redact.ErrorCode`，标记表兜底）、≤1 次重试判定（共用同一 `Deadline`）、usage 映射与"该发什么类别"（`FollowUp`） | 不发送；不导入框架；不建网关或客户端；不组装人格与上下文（属 `context_assembly.py`）；不读写历史与存储；不 reserve 也不结算金额；不读取推理字段；不追加工具；不含任何群内文案 | R-CHAT、R-OPS | 新增，**已实现离线部分**（见 §5.2 实施判断） |
 | `budget.py` | 调度前预留、返回后按 usage 结算；日/月上限与暂停；抽取预算门槛 | 不硬编码价目；不把缺失 usage 计为零 | R-OPS、R-MEM | 新增 |
 | `scheduler.py` | 全局 2 / 同群 1；群聊天队列 3；全局抽取队列 20；待调度 30 秒；业务期限 45 秒；聊天优先；同群串行锁 | 不与框架原生会话锁重复获取造成死锁；不持久化正文 | R-OPS | 新增 |
-| `send_gate.py` | 发送前复核源事件、群开关、授权与修订号；不一致即丢弃 | 不在门控前发送；不承诺 exactly-once | R-TRG、R-DATA、R-OPS | 新增 |
+| `send_gate.py` | 出站前复核：源范围 → 源触发形态 → 目标群一致 → 群开关 → 修订号 → 发送不确定；不一致即丢弃 | 不发送；不调模型；不做补救；群开关与修订号由调用方注入（无默认值）；不提供任何回执或送达 API；固定提示构造时即禁止模型调用 | R-TRG、R-DATA、R-OPS | 新增，**已实现**（见 §5.2 实施判断） |
 | `dedup.py` | 事件去重 + 记忆写入去重（源消息 + 动作） | 不保存原文；不无限保留 | R-OPS | 新增 |
-| `redact.py` | 类别化日志、脱敏关联号、保留期与大小策略 | 不记正文、请求体、密钥、推理文本 | R-OPS、R-DATA | 新增 |
-| `health.py` | 连接与离线状态、抽取失败计数、降级标志、预算状态（供维护者状态查询） | 不在群内主动广播故障 | R-QQ、R-OPS、R-ADM | 新增 |
+| `redact.py` | 类别化日志记录（`AuditRecord` 无自由文本字段）、错误码闭集、每进程加盐的关联标识、保留期与大小策略、AstrBot/NapCat 日志审计清单 | 不做日志 IO；不轮转文件；不记正文、请求体、密钥、推理文本；关联摘要不可还原且跨重启不可关联 | R-OPS、R-DATA | 新增，**已实现**（见 §5.2 实施判断） |
+| `health.py` | 平台状态归一化（只认 `Platform.status` 四个取值）、持久降级标志、抽取失败计数、供维护者查询的快照与文本 | 不导入框架；不探测；不发送；不表示 QQ 登录态；不读 `instance.config` 与任何错误文本/堆栈 | R-QQ、R-OPS、R-ADM | 新增，**已实现**（见 §5.2 实施判断） |
 | `storage/*` | 插件专用 SQLite；短事务；修订号；删除覆盖 | 不在事务内等网络；不存全量群聊；不被原生数据库替代 | R-MEM、R-DATA、R-CTX | 新增包 |
 | `memory/*` | 候选 → 独立抽取 → 严格解析 → 短事务写回；隔离检索 | 不使用千鹤人设或群历史；不递归触发；不接受模型决定归属 | R-MEM、R-DATA、R-OPS | 新增包 |
 
@@ -186,9 +187,9 @@ scripts/               【新增目录】S0 核验脚本；不属于产品插件
 |---|---|---|---|
 | K1 | 任一插件 handler 的 filter 通过即置 `event.is_wake = True`，事件不再被自动停止 | `astrbot/core/pipeline/waking_check/stage.py:232-233`（另有 `:127-129`、`:146-147`、`:156-157` 三处别的唤醒分支） | 骨架的单一宽 filter 已使所有 aiocqhttp 事件"通过唤醒检查"——G02 未通过的结构性原因。**离线性已证实**：见附录 D.3 |
 | K2 | `WakingCheckStage` 会主动发群消息：filter 抛异常时，以及权限不足且 `no_permission_reply` 开启时 | 同文件 `:202-210`、`:217-222` | 严格 @ 不能只靠插件优先级，必须靠"只启用本插件 + 禁用内置命令 + 关闭该回复"共同保证 |
-| K3 | 私聊默认唤醒（`friend_message_needs_wake_prefix` 默认 `False`） | 同文件 `:151-159` | "私聊不聊天"必须由插件显式 `should_call_llm(False)` + `stop_event()` 兜底 |
+| K3 | 私聊默认唤醒（`friend_message_needs_wake_prefix` 默认 `False`） | 同文件 `:151-159` | "私聊不聊天"由插件显式拒绝（不产生任何模型请求），框架侧另置 `friend_message_needs_wake_prefix=true`（附录 D.2）。**2026-09-18 修正**：原文建议的 `should_call_llm(False)` 并不抑制默认路径，见 K5 |
 | K4 | `ProcessStage` 在 handler 之后还有第二条默认 LLM 路径 | `astrbot/core/pipeline/process_stage/stage.py:52-67` | 必须验证"一次 @ = 一次模型调用"，否则同一事件可能双次计费 |
-| K5 | `should_call_llm(False)` 只阻止默认 LLM 链路，不阻止插件主动请求 | `astrbot/core/platform/astr_message_event.py:372-377` | 可作为确定的去重与门控手段 |
+| K5 | ~~`should_call_llm(False)` 可阻止默认 LLM 链路~~ **2026-09-18 修正：原文把语义写反。** `event.call_llm` 初值为 `False`，第二路径的门槛是 `not event.call_llm`，因此**只有 `should_call_llm(True)` 才抑制默认链路**；传 `False` 什么也不改变。两者都不阻止插件自己发起请求 | `astr_message_event.py:94`（初值）、`:372-377`（上游 docstring 与代码语义相反，易误读）；`process_stage/stage.py:56-67` | 收口默认路径用 `should_call_llm(True)`；需要交给 RespondStage 送出的回复**不能** `stop_event()`，否则回复不会发出（`stop_event()` 同时满足内层条件而抑制默认路径） |
 | K6 | `mark_as_temp()` 作用于 ContentPart；`_save_to_history` 跳过 `_no_save` 的 user/assistant 消息 | `astrbot/core/agent/message.py:68-76`、`.../agent_sub_stages/internal.py:580` | "记忆辅助整轮不落共享历史"在机制上可行，但需同时覆盖 user 侧与 assistant 侧 |
 | K7 | `STAGES_ORDER` 为固定列表，插件无法注册自定义 Stage | `astrbot/core/pipeline/stage_order.py:3-13` | "在 WakingCheck 之前拦截"不可行，只能靠配置 + handler |
 | K8 | EventBus 为每个事件创建独立 asyncio task | `astrbot/core/event_bus.py:39-54` | "同群并发 1"必须自行加锁，不能依赖框架 |
@@ -197,12 +198,13 @@ scripts/               【新增目录】S0 核验脚本；不属于产品插件
 | K11 | `Context` 提供 `register_task`、`conversation_manager`、`message_history_manager`、`get_platform_inst`、`get_using_provider_async`、`get_db` | `astrbot/core/star/context.py:157/159/482/761/777/884` | 不需要自建网关；后台任务有官方登记位 |
 | K12 | 现有离线测试 audit hook 无条件禁止 `sqlite3.connect` | `tests/test_plugin.py:23-27` | 存储类任务需**有作用域地放宽**（白名单临时库路径），不得删除整体守卫 |
 | K13 | 内置群上下文实现为"宽 filter 的 on_message 采集 + on_llm_request 注入 + after_message_sent 清理" | `astrbot/builtin_stars/astrbot/main.py:196-273`、`.../group_chat_context.py` | 架构 §3.1 要求关闭它；本插件复用其机制形态但不复用其存储 |
+| K14 | **框架侧模型路径的两道门**：①`provider_settings.enable=false` 使 ProcessStage 的第二条默认路径整体关闭，并使 `AgentRequestSubStage.process` 在入口立即返回——**插件经 `event.request_llm` 的请求也走这条路径，因此该键为 `false` 时插件不能使用它**（注意 ProcessStage 的 handler 分支本身不检查该键，短路发生在它委托的子阶段里）；②第二路径的门槛是 `not _has_send_oper ∧ is_at_or_wake_command ∧ not call_llm` 且内层 `(有结果 ∧ ¬已停止) ∨ 无结果`；③`event.request_llm` **没有**重试参数，而 `Provider.text_chat` 有 `request_max_retries` | `process_stage/stage.py:52-67`、`method/agent_request.py:30-33`、`platform/astr_message_event.py:425-479`（request_llm 签名）、`provider/provider.py`（text_chat 签名） | 决定 S1-10 走**直调提供商**（附录 D.2）：插件自己按 `LLMRequestPlan.call_kwargs()` 调用 `Provider.text_chat`，重试次数可按次传入；已由 `scripts/s0/check_single_call.py` 离线钉住 |
 
 ### 3.5 需显式声明的设计判断
 
 以下两条是**新增的设计选择**，两份既有文档未指定，因此必须在本文声明并由 S0 实测确认：
 
-1. **普通群消息采集的钩子形态。** 拟采用宽 filter 的 `on_message` 进行采集（复用 K13 的机制形态），并接受它会因 K1 使事件被视为 wake；随后用 `should_call_llm(False)` + `stop_event()` 收口。若 S0-03 证明该副作用无法被覆盖，改用其他已审计方案或回设计评审。
+1. **普通群消息采集的钩子形态。** 拟采用宽 filter 的 `on_message` 进行采集（复用 K13 的机制形态），并接受它会因 K1 使事件被视为 wake；随后由插件拒绝产生任何模型请求（`provider_settings.enable=false` 已关闭框架默认路径，K14），并显式结束本次处理。若 S0-03 证明该副作用无法被覆盖，改用其他已审计方案或回设计评审。**2026-09-18 修正**：收口不再依赖 `should_call_llm(False)`（那是无效调用，见 K5）。
 2. **非 @ 与私聊的兜底责任在插件。** K2、K3 表明框架默认行为并不满足"仅被 @ 时回复"，因此由插件对每个事件显式收口；框架侧配置（`disable_builtin_commands`、`no_permission_reply`、`friend_message_needs_wake_prefix` 等）在 S0-02 列为必核清单。
 
 群告知的两步开启原属本节，已于 2026-09-17 先后补入需求 §4.4 与架构 §4.4（架构文档版本 0.3），因而不再满足"既有文档未指定"，已从本节移出；其实施细节见第 9.1 节 B1a 与附录 C.1。
@@ -268,7 +270,7 @@ scripts/               【新增目录】S0 核验脚本；不属于产品插件
 | S1-07 | 有界队列与并发调度【已完成】 | S1-01、S1-02 | `scheduler.py` | R-OPS | A15 | 全局 2 / 同群 1；群聊天队列 3；全局抽取队列 20；待调度 30 秒；单任务 45 秒；聊天优先于抽取；同群串行不死锁（K8）；重启丢弃在途任务。**实际边界见下方实施判断** |
 | S1-08 | 事件与动作去重【已完成】 | S0-08、S1-02 | `dedup.py` | R-OPS | A15 | 同一事件不重复回复；键 = 平台实例 + 群 + message_id + 动作类别；有界保留；不含原文。**窗口取值不在本任务**，见下方实施判断 |
 | S1-09 | 用量与预算核算【已完成】 | S1-01、S1-07 | `budget.py` | R-OPS、R-MEM | A17 | 调度前预留、返回后按 usage 结算（K10）；缺失 usage 标记为估算而非零；日/月上限与暂停规则；**未配置抽取预算时自动抽取保持关闭并在状态中显示**。抽取停用阈值见下方实施判断 |
-| S1-10 | 提供商调用封装与错误分类 | S0-07、S1-09 | `llm.py` | R-CHAT、R-OPS | A01、A16 | 仅使用正式回复内容；不输出推理字段；覆盖 §8.3 错误分类；最多重试 1 次且不重置总期限；不追加工具权限 |
+| S1-10 | 提供商调用封装与错误分类【已完成·仅离线部分】 | S0-07（**仅在线部分**，见下方实施判断）、S1-09 | `llm.py` | R-CHAT、R-OPS | A01、A16 | 仅使用正式回复内容；不输出推理字段；覆盖 §8.3 错误分类；最多重试 1 次且不重置总期限；不追加工具权限。**离线部分已交付**：请求计划的字段与 `call_kwargs()` 键集固定且无工具参数；失败分支不携带任何模型文本；未知错误码一律 `UNCLASSIFIED`；`RetryPolicy` 只对暂时故障重试且从不新建期限。**在线部分仍【阻塞·凭据】**：真实 401/402/429/5xx 的可分类性、真实 usage 可读性、框架与 SDK 叠加后的实际请求数（S0-07、R19、S4-02/G06） |
 | S1-11 | 人格分层与静态规则【待审·剧透策略见附录 C.4】 | S0-04、S1-01 | `context_assembly.py` 静态部分 + 人格文本草案 | R-PER、R-CHAT | A13、A14 | 固定规则由维护者管理且版本可追溯；动态内容不进 system 角色；当前输入用 user 角色；不信任 `message_str`（沿用骨架已有立场） |
 | S1-12 | 发送门控【已完成】 | S1-02、S1-06 | `send_gate.py` | R-TRG、R-DATA、R-OPS | A02、A10 | 发送前复核源事件、群开关、修订号；不一致即丢弃；固定提示不再调用 LLM；不承诺 exactly-once。**实际边界见下方实施判断**：群开关与修订号由调用方注入，门控只覆盖本插件出站 |
 | S1-13 | 日志与脱敏【已完成】 | S1-01 | `redact.py` | R-OPS、R-DATA | A19 | 只记类别、耗时、错误码、token 与脱敏关联标识；无正文、请求体、密钥、推理文本；默认 7 天与总大小上限；覆盖 AstrBot 与 NapCat 自身日志的审计清单。**实际边界见下方实施判断**：只定义策略不执行 IO，总大小上限为建议参数 |
@@ -334,6 +336,21 @@ S1-06 原判据含两件不同性质的事，其中一件在 S1 无法完成：
 | 策略与执行的边界 | `redact.py` 不做日志 IO、不轮转文件；`health.py` 不发送、不探测；两者的执行与核验归 S1-14 与 S4-04 | 纯逻辑模块才能离线测试且无进程副作用；把 IO 放进来会让"离线核验"变成"有一个正在写文件的进程" |
 
 三张卡的判据都**只有离线部分成立**：平台读数、门控接入与日志落地要等 S1-14 装配，在线行为仍待 S1-16 与 S4-06。
+
+**S1-10 的实施判断（2026-09-18，用户批准拆分）**
+
+| 事项 | 决定 | 理由 |
+|---|---|---|
+| 判据拆分 | S1-10 的依赖 `S0-07` 只阻塞**在线部分**；离线部分（请求成形、回复解释、错误分类、重试判定、usage 映射）立即开工 | 本表 §7.1 已把 A01 写成「S1-10、S1-16（**假提供商**）」、A16 写成「是（**错误注入**）」，也就是计划自己承诺了离线验证。原依赖把"提供商真实能力"与"插件侧逻辑"绑成一件事，使已承诺的工作无法开工；S1-14 的依赖不拆，仍等 S1-10 与 S1-11 齐备 |
+| 调用路径 | **直调提供商**：`context.get_using_provider_async(...)` → `Provider.text_chat(**LLMRequestPlan.call_kwargs())` | 附录 D.2 是唯一写明路径的地方（"本插件经 `get_using_provider_async` 直接取提供商"），且 `provider_settings.enable=false` 会关掉 `event.request_llm` 所依赖的子阶段（K14）。随之确定：`on_llm_request` 注入改为 **S2-06 直传 `extra_user_content_parts`**，"互动历史由 AstrBot 保存"改由 **S2-07 经框架会话/历史接口维护**——落地时回写架构 §3/§4.3/§6.1，本批不改架构文档 |
+| 重试上限 | `request_max_retries=LimitsSettings.max_retries` 每次调用显式传入，插件侧"≤1 次"可控；**框架内层重试与 SDK 重试另计**（R19） | 需求 §6/B3 要求"最多 1 次且不重置总期限、需合并 SDK 重试计算"。`event.request_llm` 根本没有重试参数（K14），这是直调路径的直接收益；叠加后的实际请求数只能在线测量 |
+| 退避时长 | **不实现**：`RetryPolicy.decide` 只回答能不能再试 | 架构 §8.3 只要求"期限内有限退避"，真实 429 行为未测（S4-02）；先写一个秒数就是把未核验的假设写成参数 |
+| usage | 缺失或**全零**一律映射为 `None`（未知），由 `budget.settle` 按预留估算 | 框架适配器在 API 未返回 usage 时塞的是全零对象，与"真的用了 0 token"无法区分；需求 §6 与架构 §7.2 要求"缺失 usage 记估算而非零" |
+| 工具与推理 | 结构性排除：`LLMRequestPlan` 无工具字段、`call_kwargs()` 键集固定，`ResponseFacts` 无推理字段且全文不出现 `reasoning` | R-CHAT/架构 §7.1 的"不开放工具、不展示推理"必须是结构事实；测试用"读推理就抛异常"的替身与全文扫描双重钉住 |
+| 错误分类来源 | 优先级：异常自带状态码 → 异常类型 → 小写标记表（≤12 条、纯字面量） → `UNCLASSIFIED` | 直调路径能拿到原始异常；标记表只作兜底，未知输入不猜（`redact.ErrorCode` 是唯一闭集，不另立 HTTP 表） |
+| 群内去向 | `FollowUp` 只定类别（`send_text` / `fixed_notice` / `nothing`），**不含文案**；`UNCLASSIFIED` 与后台任务恒为 `nothing` | 架构 §8.3 要求"后台故障不发群通知""未知不猜"；失败提示文案属 S4-01 的故障矩阵与附录 C 待审范围，此刻发明文案会先于评审 |
+
+离线核验入口：`scripts/s0/check_single_call.py`（24 项，已接入 `run_all.sh`）钉住 K4 双次调用、K5 修正后的 `should_call_llm` 语义、`enable=false` 的两道门，以及 `LLMRequestPlan.call_kwargs()` 与真实 `Provider.text_chat` 签名的对齐。
 
 ### 5.3 S2 群上下文（10 项）
 
@@ -509,6 +526,7 @@ S0-01 → S0-02 → S0-03 → S1-01 → S1-02 → S1-03 → S1-14 → S1-15 → 
 | R16 | 框架对会话与平台消息历史**没有原生 TTL**；`agent_runner…compression.max_turns` 默认 `-1`（不限） | R-CTX 的 20 轮/24 小时与 R-MEM 的 90 天全部需要插件自建清理 | S2-07、S2-08、S3-02 | **离线已证实** |
 | R17 | `Platform.status` 只反映适配器任务生命周期，**不含 QQ 登录态与连接质量**；`get_stats()['last_error']['traceback']` 是自由文本，`Platform.config` 含 `ws_reverse_token` | 误把"适配器在跑"当成"账号在线"，G01/A01 的判断失真；直接取用错误详情会把堆栈或凭据带进日志 | S1-04、S4-06 | **离线已证实**（源码）：`health.py` 只映射四个既有状态、只计 `len(errors)`，报告固定输出"账号在线性：未知"；在线待验证 |
 | R18 | 上游日志**不做任何脱敏**：`astrbot/core/log.py` 原样转发格式化文本到文件与 WebUI 缓存（`deque(maxlen=500)`）；轮转 `backup_count` 硬编码为 3，保留天数无配置键 | G07/A19 失败：正文或密钥经框架日志落盘，且插件无法用配置收紧 | S1-13、S4-04 | **离线已证实**（源码）：`redact.py` 已把插件侧记录收敛为结构化字段并给出 `AUDIT_CHECKLIST`；框架侧只能审计，在线待验证 |
+| R19 | **重试层数叠加**：插件按次传入的 `request_max_retries` 只覆盖 `request_retry.py` 的 `stop_after_attempt`；OpenAI 适配器另有外层 `max_retries = 10` 循环，`AsyncOpenAI` 未设 `max_retries` 因而沿用 SDK 默认 2 | G06/A16 判断失真：一次 @ 的真实请求数可能远大于"1 次 + 1 次重试"，成本与 429 退避都会偏离预期 | S1-10、S4-02 | **离线已证实**（层数与参数位置；`check_single_call.py` 钉住 `request_max_retries`/`func_tool` 等签名）；**实际总次数只能在线验证** |
 
 ## 9. 阻塞清单与确认状态
 
@@ -859,7 +877,7 @@ DeepSeek 处理，而且已经发出的群消息其他成员都能看到，无�
 | `platform_settings.ignore_at_all` | `False` | `true` | @全体 唤醒 |
 | `platform_settings.ignore_bot_self_message` | `False` | `true` | 机器人自身消息 |
 | `platform_settings.unique_session` | `False` | **保持 `false`** | 开启会按成员隔离会话，与 R-CTX"同群共享上下文"冲突 |
-| `provider_settings.enable` | `True` | `false` | 框架默认 LLM 路径（含 K4 第二条路径）。本插件经 `get_using_provider_async` 直接取提供商，不受影响 |
+| `provider_settings.enable` | `True` | `false` | 框架默认 LLM 路径（含 K4 第二条路径）。本插件经 `get_using_provider_async` 直接取提供商，不受影响。**2026-09-18 补注**：该键同时关掉 `AgentRequestSubStage` 的入口（K14），因此它也是"插件不使用 `event.request_llm`"这一决定的前提——若将来改用 `event.request_llm`，必须同时把本项改回 `true` 并另行收口默认路径 |
 | `provider_settings.streaming_response` | `False` | `false` | 流式发送路径 |
 | `provider_settings.wake_prefix` | `""` | `""` | 额外的 LLM 唤醒前缀 |
 | `provider_settings.proactive_capability.add_cron_tools` | `True` | `false` | cron 工具暴露；另需确认无已存在任务 |
@@ -885,6 +903,7 @@ DeepSeek 处理，而且已经发出的群消息其他成员都能看到，无�
 | S0-05 | 无原生 TTL；umo 只含群号，删除即整群；原生无成员级删除；`max_turns` 默认 `-1` | `check_history.py` 11/11 |
 | S0-06 | 出站面 123 处/53 文件已指纹固化；11 条关键上游行为假设仍成立 | `check_outbound.py` 15/15 |
 | K12 | 测试守卫改为作用域化（只放行 `.runtime/`），有回归用例钉住 | `tests/test_plugin.py` 新增用例，全套 17 项通过 |
+| S1-10（离线） | 单次调用语义：K4 的第二条默认路径存在且只有 `should_call_llm(True)` 能抑制（K5 修正）；`enable=false` 关闭框架侧全部模型路径（K14）；`LLMRequestPlan.call_kwargs()` 与真实 `Provider.text_chat` 签名对齐 | `check_single_call.py` 24/24 |
 
 **在线待办（阻塞于账号与凭据，条件具备时按此清单执行）**
 
@@ -892,7 +911,7 @@ DeepSeek 处理，而且已经发出的群消息其他成员都能看到，无�
 |---|---|---|---|
 | O-01 | 真实实例零出站 | 加载本插件 + 附录 D.2 配置，向测试群发送非 @ 消息、@他人、私聊 | 群内与私聊均无任何回复；NapCat 侧无出站记录 |
 | O-02 | 空 @ 不续聊 | 发送仅含 @机器人 的消息，随后跟一条普通文本 | 不回复；不出现"想要问些什么"；后续那条普通文本不被回复 |
-| O-03 | 一次 @ 只调用一次模型 | 配好 DeepSeek 后 @ 一次，核对提供商侧请求数 | 恰好 1 次请求，无第二条默认 LLM 路径 |
+| O-03 | 一次 @ 只调用一次模型 | 配好 DeepSeek 后 @ 一次，核对提供商侧请求数；同时记录**合并框架内层重试与 SDK 重试后的实际请求数**（R19） | 恰好 1 次请求、无第二条默认 LLM 路径；重试场景（429/5xx）的实际次数与 `RetryPolicy` 的判定一致 |
 | O-04 | 私聊不回复 | 私聊发送任意文本 | 无回复 |
 | O-05 | 真实落库前后对比 | 按 S0-04 两层机制注入临时材料，读 SQLite 的 `conversations.content` | 注入片段与整轮均不入库；重启后仍不在 |
 | O-06 | 真实删除 | 建会话后按 umo 删除，重启复查 | 行已删除且不复活；影响范围为整群（需向成员告知） |
