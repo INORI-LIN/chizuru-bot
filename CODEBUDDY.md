@@ -10,8 +10,8 @@ This file provides guidance to CodeBuddy Code when working with code in this rep
 以《租借女友》水原千鹤为人设参考。**非官方、仅被 @ 时回复、不主动接话**。
 
 **当前状态：未上线。** S0 离线核验完成，但 **S0 阶段门于 2026-09-17 被维护者决定有意跳过（不是通过）**，
-在线部分（真实 QQ/NapCat/DeepSeek）从未验证。S1 进行中：`S1-01/02/03/05/06/07/08/09` 已完成，
-`S1-04`、`S1-10`—`S1-16` 未开始；S2/S3/S4 未开始。
+在线部分（真实 QQ/NapCat/DeepSeek）从未验证。S1 进行中：`S1-01/02/03/04/05/06/07/08/09/12/13` 已完成，
+`S1-10`、`S1-11`、`S1-14`—`S1-16` 未开始；S2/S3/S4 未开始。
 
 | 文档 | 角色 |
 |---|---|
@@ -29,7 +29,7 @@ export ASTRBOT_BUILD_DASHBOARD=0   # 阻止上游构建钩子运行 npm
 ```
 
 ```sh
-# 全量离线核验：6 个 S0 核验脚本 + 全部单元测试（当前共 145 项单元测试）
+# 全量离线核验：6 个 S0 核验脚本 + 全部单元测试（当前共 237 项单元测试）
 bash scripts/s0/run_all.sh
 
 # 只跑全部单元测试
@@ -83,7 +83,7 @@ OneBot 事件 → main.py（唯一框架入口、薄适配，提取 MessageFacts
   → commands.parse（指令 / 聊天分流）
   → control.authorize（确定性权限判定；只来自可信身份 + 显式配置）
   → dedup.begin（事件与动作去重）→ budget.reserve（先预留）→ scheduler.submit（准入）
-  → llm.py（S1-10，未实现）→ send_gate.py（S1-12，未实现）→ 唯一出站路径
+  → llm.py（S1-10，未实现）→ send_gate.evaluate（S1-12，已实现）→ 唯一出站路径
 ```
 
 ### 模块边界（每个模块"必须不做"与职责同等重要）
@@ -99,9 +99,12 @@ OneBot 事件 → main.py（唯一框架入口、薄适配，提取 MessageFacts
 | `scheduler.py` | 有界队列、全局/同群并发、业务期限；聊天优先于抽取 | 不发送、不调模型、不读存储、不判权限、不重试；**不用 `asyncio.Semaphore`**（FIFO 无法表达聊天优先）；不持有后台任务 |
 | `dedup.py` | 事件与动作去重：`IN_FLIGHT` / `DONE` / `UNCERTAIN`；有界（容量 + TTL） | 不保存任何正文；**窗口无默认值，必须由调用方注入**；`release()` 仅限确认无副作用时 |
 | `budget.py` | 预留 / 按 usage 结算 / 门槛核算 | 不调模型、不硬编码价目；缺失 usage 记估算**而非零**；价格未知且已配金额时保守拒绝 |
+| `health.py` | 平台状态归一化（只认 `Platform.status` 四个取值，其余落 `UNKNOWN`）、持久降级标志、抽取失败计数、供维护者查询的快照与文本 | 不导入框架、不探测、不发送；**不表示 QQ 登录态**（报告固定输出"未知"）；不读 `instance.config`（含 token）与任何错误文本/堆栈 |
+| `send_gate.py` | 出站前复核：源范围 → 源触发形态 → 目标群一致 → 群开关 → 修订号 → 发送不确定；不一致即丢弃 | 不发送、不调模型、不做补救；**群开关与修订号由调用方注入**（无默认值）；不提供任何回执/送达 API；固定提示构造时即禁止模型调用 |
+| `redact.py` | 类别化日志记录（`AuditRecord` 无自由文本字段）、错误码闭集、每进程加盐的关联标识、保留期与大小策略、AstrBot/NapCat 日志审计清单 | 不做日志 IO、不轮转文件（`logging` 都不导入）；不记正文/请求体/密钥/推理文本；关联摘要不可还原、跨重启不可关联（刻意取舍） |
 
-**尚不存在**（属后续任务卡，不要 import）：`health.py`（S1-04）、`llm.py`（S1-10）、
-`context_assembly.py`（S1-11）、`send_gate.py`（S1-12）、`redact.py`（S1-13）、`storage/`、`memory/`。
+**尚不存在**（属后续任务卡，不要 import）：`llm.py`（S1-10）、`context_assembly.py`（S1-11）、
+`storage/`、`memory/`。
 docs/03 §3.2 的目录树是**拟议结构**，不是现状清单——判断某文件是否存在请直接看仓库。
 
 ### 不可违背的硬约束
