@@ -259,11 +259,31 @@ def render_materials(
 
 
 @dataclass(frozen=True)
+class TextBlock:
+    """第二个临时块（S3-08 起用于长期记忆）：标题 + 行，**没有发言者行**。
+
+    与 ``Materials`` 同构（渲染规则一致：标题在前、空行不渲染），因此两者受同一套
+    "只落 user 侧、可裁剪、可标记临时"的约束。标题由调用方给出：块文本属各自的领域
+    模块（记忆块的标题与类别名在 ``memory/retrieve.py``，同样是待评审的模型可见文本）。
+    """
+
+    title: str
+    lines: tuple[str, ...] = ()
+
+    def render(self, lines: Sequence[str] | None = None) -> str | None:
+        selected = tuple(self.lines if lines is None else lines)
+        if not selected:
+            return None
+        return "\n".join([self.title, *selected])
+
+
+@dataclass(frozen=True)
 class TrimmedContext:
-    """裁剪结果：材料块文本（可为 `None`）与历史 `contexts`（已剥离私有键）。"""
+    """裁剪结果：材料块、记忆块（都可为 `None`）与历史 `contexts`（已剥离私有键）。"""
 
     materials: str | None
     contexts: tuple[dict[str, str], ...]
+    memory: str | None = None
 
 
 def _line_cost(line: str) -> int:
@@ -277,12 +297,16 @@ def trim_to_budget(
     materials: Materials | None,
     history_turns: Sequence[Turn],
     budget: int,
+    memory_block: TextBlock | None = None,
 ) -> TrimmedContext | None:
-    """按总输入预算裁剪动态材料与历史；`None` 表示**拒绝本次请求**。
+    """按总输入预算裁剪记忆块、动态材料与历史；`None` 表示**拒绝本次请求**。
 
-    顺序（架构 §5.2）：固定规则与当前输入不可裁；先裁最旧的群聊材料，再裁最旧的历史轮次。
-    只有"固定规则 + 当前输入"本身就超预算时才拒绝——拒绝时不调模型、不发送、不发明提示文案
-    （超长提示文案属附录 C 待审范围）。
+    顺序（架构 §5.2）：固定规则与当前输入不可裁；然后是**记忆块 → 群聊材料 → 历史轮次**，
+    即预算不够时先丢群聊材料、再丢记忆行、最后丢历史。记忆行按**记录号从新到旧**保留
+    （无相关性信号时以新近度代替，与需求 §4.3"以本人后续明确表达为准"同向）。
+
+    只有"固定规则 + 当前输入"本身就超预算时才拒绝——拒绝时不调模型、不发送、不发明提示
+    文案（超长提示文案属附录 C 待审范围）。
     """
     if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
         raise ValueError("budget 必须是正整数")
@@ -290,24 +314,37 @@ def trim_to_budget(
     if base >= budget:
         return None
     remaining = budget - base
-
-    kept_lines: tuple[str, ...] = ()
     spent = 0
+
+    memory_text: str | None = None
+    if memory_block is not None and memory_block.lines:
+        running = _line_cost(memory_block.title)
+        chosen_memory: list[str] = []
+        for line in reversed(memory_block.lines):
+            cost = _line_cost(line)
+            if spent + running + cost > remaining:
+                break
+            chosen_memory.append(line)
+            running += cost
+        chosen_memory.reverse()
+        memory_text = memory_block.render(tuple(chosen_memory))
+        if memory_text is not None:
+            spent += running
+
+    material_text: str | None = None
     if materials is not None and materials.lines:
         running = _line_cost(MATERIAL_TITLE) + (_line_cost(materials.speaker) if materials.speaker else 0)
         chosen: list[str] = []
         for line in reversed(materials.lines):
             cost = _line_cost(line)
-            if running + cost > remaining:
+            if spent + running + cost > remaining:
                 break
             chosen.append(line)
             running += cost
         chosen.reverse()
-        kept_lines = tuple(chosen)
-        spent = running if kept_lines else 0
-    material_text = materials.render(kept_lines) if materials is not None else None
-    if material_text is None:
-        spent = 0
+        material_text = materials.render(tuple(chosen))
+        if material_text is not None:
+            spent += running
 
     chosen_turns: list[Turn] = []
     for turn in reversed(tuple(history_turns)):
@@ -320,7 +357,11 @@ def trim_to_budget(
         chosen_turns.append(turn)
         spent += cost
     chosen_turns.reverse()
-    return TrimmedContext(materials=material_text, contexts=flatten(chosen_turns))
+    return TrimmedContext(
+        materials=material_text,
+        memory=memory_text,
+        contexts=flatten(chosen_turns),
+    )
 
 
 def build_chat_plan(

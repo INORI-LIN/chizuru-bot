@@ -17,12 +17,13 @@ This file provides guidance to CodeBuddy Code when working with code in this rep
 告知两步开启与维护者命令、清理覆盖与启动裁剪、`main.py` 接线）；**`S2-02`/`S2-05` 的前置已由维护者确认**
 （2026-09-18：维护者清单与目标群已定，值只进运行时配置；附录 C.1 告知文案定稿），
 `S2-10` 阶段门的**门禁记录已产出（docs/03 附录 F）且结论为未通过**（S1 门未过、无在线证据；G03 的记忆辅助整轮与 G04 的 A09/A10 属 S3），**S2 不得宣称完成、S3 入口仍不成立**。
-**S3 于 2026-09-18 离线先行**（docs/03 §9.6，性质同 S0/S2 的"有意先行"）：批次 3a（`S3-01`/`S3-02`）、3b（`S3-05`/`S3-06`）与 3c（`S3-07`/`S3-10`）的**离线部分**已完成——
+**S3 于 2026-09-18 离线先行**（docs/03 §9.6，性质同 S0/S2 的"有意先行"）：批次 3a（`S3-01`/`S3-02`）、3b（`S3-05`/`S3-06`）、3c（`S3-07`/`S3-10`）与 3d（`S3-08`/`S3-09`）的**离线部分**已完成——
 `storage/schema.py` 升到 `SCHEMA_VERSION=2` 并新增记忆授权、低敏事实、来源去重三张 STRICT 表，`storage/memories.py` 提供仓储
 （上限与保留期由调用方注入），`members.bump_member_revision` 让记忆变更复用成员修订号；`memory/` 包落地类别白名单与候选校验、
-独立抽取请求与结构化解析（**提示词为待审初稿**，`extract-1` + 指纹钉住）、以及抽取的准入与单事务写回（回复之后 inline 运行、
-零额外出站、失败不影响聊天，失败/成功计入 `health` 计数）；计划批次 3d—3e 见 docs/03 §4.2，
-`S3-03`/`S3-04` 因附录 C.2/C.3 未定稿保持【待审】、`S3-13` 不排期。**S3 不得宣称完成**；S4 未开始。
+独立抽取请求与结构化解析（**提示词为待审初稿**，`extract-1` + 指纹钉住）、抽取的准入与单事务写回（回复之后 inline 运行、
+零额外出站、失败不影响聊天）、以及隔离检索与临时注入（**用了记忆的那一轮不落共享历史**，附录 F 的 G03-③ 由此闭合）；
+计划批次仅剩 3e（S3-11/S3-12，见 docs/03 §4.2），`S3-03`/`S3-04` 因附录 C.2/C.3 未定稿保持【待审】、`S3-13` 不排期。
+**S3 不得宣称完成**；S4 未开始。
 **生产环境采集与记忆均默认关闭**：采集需维护者在运行时配置里填入允许群与维护者并完成一次两步开启；
 记忆链路在 `S3-03` 落地前**没有任何合法写入路径**（不得手工写库充当验收证据）。
 
@@ -133,10 +134,10 @@ OneBot 事件 → main.py（唯一框架入口、薄适配，提取 MessageFacts
 | `redact.py` | 类别化日志记录（`AuditRecord` 无自由文本字段）、错误码闭集、每进程加盐的关联标识、保留期与大小策略、AstrBot/NapCat 日志审计清单 | 不做日志 IO、不轮转文件（`logging` 都不导入）；不记正文/请求体/密钥/推理文本；关联摘要不可还原、跨重启不可关联（刻意取舍） |
 | `context_buffer.py` | 普通群聊内存环形缓冲（S2-03）：30 条/10 分钟取严、惰性淘汰、无后台任务；形状/命令/敏感/自身/重复全部拒绝；`clear_group`/`clear_member`；条目附带昵称（**仅展示**） | 不落盘、不请求模型、不发消息、不导入框架；**条数与 TTL 由调用方注入**；不采集未告知群；昵称不进键、不参与判定 |
 | `storage/*` | 插件 SQLite（S2-01/S2-04/S2-05 + S3-01/S3-02）：`db`（延迟建库、短事务、失败不恢复）、`schema`（**五张** STRICT 表 + `user_version`，版本 2）、`groups`（群策略仓储，无行即关闭；`bump_revision` 供清空与无行群的暂停使用）、`members`（退出/加入 + 成员修订号，含 `bump_member_revision`）、`memories`（记忆授权、低敏事实、来源去重） | 不在事务内等网络（纯同步、只 import 标准库）；不存全量群聊；**两张 S2 表不存记忆授权**（授权只在 `memory_state`）；**上限与保留期不写默认值、由调用方注入**；路径由调用方注入（无默认值） |
-| `memory/*` | 授权记忆的候选层与管线（S3-05/S3-06/S3-07/S3-10，**3b/3c 已实现离线部分**）：`types.py`（四类白名单 `address`/`reply_length`/`interest`/`activity`、`prepare_source` 三道判定、`build_candidate` 校验）、`extract.py`（`EXTRACTION_RULES` + `EXTRACT_VERSION` 指纹钉住的**待审**提示词、`build_request` 的 `contexts`/临时材料恒空、`parse_candidates` 只读两个键且不合格整批放弃、`ExtractionStatus`）、`pipeline.py`（`admit` 的五道准入与 `write_back` 的单事务修订重核 + 来源去重 + 写入） | 不导入框架/asyncio、不发送、不做预算预留与调度（属装配层）；**不含人设与群历史**；不递归触发聊天；**不读取模型给出的身份/授权字段**——归属只来自可信事件元数据；所有准入拒绝都静默；`retrieve.py` 尚不存在 |
+| `memory/*` | 授权记忆的候选层、管线与检索（S3-05—S3-08、S3-10，**3b—3d 已实现离线部分**）：`types.py`（四类白名单 `address`/`reply_length`/`interest`/`activity`、`prepare_source` 三道判定、`build_candidate` 校验）、`extract.py`（`EXTRACTION_RULES` + `EXTRACT_VERSION` 指纹钉住的**待审**提示词、`build_request` 的 `contexts`/临时材料恒空、`parse_candidates` 只读两个键且不合格整批放弃、`ExtractionStatus`）、`pipeline.py`（`admit` 的五道准入与 `write_back` 的单事务修订重核 + 来源去重 + 写入）、`retrieve.py`（**只接受可信元数据构造的成员键**、注入块渲染：`MEMORY_BLOCK_TITLE` 与 `CATEGORY_LABELS` 逐字取自需求 §4.3，`memory-block-1` 待审） | 不导入框架/asyncio、不发送、不做预算预留与调度（属装配层）；**不含人设与群历史**；不递归触发聊天；**不读取模型给出的身份/授权字段**——归属只来自可信事件元数据；所有准入拒绝都静默；`retrieve` 没有可传入他人 ID 的入口 |
 | `llm.py` | 请求成形（`LLMRequestPlan`，键集固定、无工具参数）、回复解释（只读 `role`/`completion_text`）、错误分类（状态码委托 `redact.ErrorCode`）、≤1 次重试判定（共用同一 `Deadline`）、usage 映射、`FollowUp` 类别 | 不发送、不导入框架、不建网关/客户端；不组装人格与上下文（S1-11）；不读写历史与存储；**不读取推理字段、不追加工具**；不含任何群内文案；**在线部分未验证**（真实 401/402/429/5xx 与 usage 仍待 S0-07） |
 
-**尚不存在**（属后续任务卡，不要 import）：`memory/retrieve.py`（3d）；`storage/` 的记忆表与 `memory/` 的其余模块已存在。
+**尚不存在**（属后续任务卡，不要 import）：记忆授权确认状态机（落点待定，属 S3-03）；`storage/` 与 `memory/` 已按 3a—3d 落地。
 docs/03 §3.2 的目录树是**拟议结构**，不是现状清单——判断某文件是否存在请直接看仓库。
 
 ### 不可违背的硬约束

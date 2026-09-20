@@ -32,9 +32,12 @@
   就停下，不产生费用。聊天不要求告知，采集才要求。
 - 普通群聊采集（S2-03）与 `上下文 退出/加入`（S2-04）已接线；采集准入读持久化群策略
   （**无行即关闭**）。
-- 动态材料与互动历史（S2-06/S2-07）已接入请求：材料只落 `extra_user_content_parts` 并
-  标记为临时，历史只落 `contexts`；两者都经同一 token 预算裁剪，**结构上不进 system**。
-  超预算时不调模型、不发送、静默（超长提示文案属附录 C 待审范围）。
+- 动态材料、互动历史与**长期记忆**（S2-06/S2-07/S3-08）已接入请求：材料与记忆只落
+  `extra_user_content_parts` 并标记为临时，历史只落 `contexts`；三者都经同一 token 预算
+  裁剪，**结构上不进 system**。预算不够时先丢群聊材料、再丢记忆行、最后丢历史。超预算时
+  不调模型、不发送、静默（超长提示文案属附录 C 待审范围）。
+- 记忆注入以**本轮的修订号快照先于读取**为前置（S3-09）：用了记忆的那一轮不写回共享历史
+  （`memory_assisted`），因此注入的记忆不会永久混进群历史。
 - 互动历史写回只在**送达成功**后进行，且写前重读群/成员修订号；写失败只记审计，
   不影响已送达的回复、不置持久降级（历史不是聊天的前置条件）。
 - 群维护者命令（S2-02/S2-05）已接线：`群上下文 开启` 逐字回复附录 C.1 全文并记录
@@ -145,10 +148,13 @@ class _Services:
 
 @dataclass(frozen=True)
 class _ChatPreparation:
-    """一次聊天的装配结果：请求形态与发起时的数据修订号快照。"""
+    """一次聊天的装配结果：请求形态、发起时的数据修订号快照与"是否用了长期记忆"。"""
 
     plan: llm.LLMRequestPlan
     revision: RevisionSnapshot | None
+    memory_used: bool = False
+    """本轮是否真的把记忆行放进了请求（裁剪后仍有记忆块）。**只有 True 时**该轮不写回
+    共享历史（S3-08/需求 §4.3"注入的记忆不能永久混进群共享历史"）。"""
 
 
 class _ConversationHistory:
@@ -585,8 +591,8 @@ class ChizuruPlugin(Star):
             llm_invoked=True,
             revision=prepared.revision,
         )
-        if history.should_record(memory_assisted=False, delivered=sent):
-            # `memory_assisted` 本批恒 False；S3-08 起为"本轮检索到长期记忆"。
+        if history.should_record(memory_assisted=prepared.memory_used, delivered=sent):
+            # 记忆辅助轮（本轮请求里真的带了记忆块）不写回共享历史（S3-08，需求 §4.3）。
             await self._record_history(event, facts, settings, services, answer.text, prepared.revision)
         services.dedup.finish(key, outcome)
         await self._extract_memory(
@@ -606,13 +612,18 @@ class ChizuruPlugin(Star):
         services: _Services,
         message_id: str,
     ) -> _ChatPreparation | None:
-        """装配一次聊天请求：动态材料 + 合格历史 + 修订号快照；超预算返回 `None`。
+        """装配一次聊天请求：修订快照 + 记忆块 + 动态材料 + 合格历史；超预算返回 `None`。
 
-        材料来自内存缓冲（同一事件已按 message_id 排除），历史来自会话存储并已按
-        轮数/TTL 筛选；两者都经同一 token 预算裁剪（架构 §5.2）。**材料只进
-        `extra_user_content_parts` 并标记为临时，历史只进 `contexts`，都不进 system。**
+        **修订号快照先于一切读取**（S3-09"修订校验贯穿读"）：快照之后发生的退出、清空、
+        暂停或记忆纠正都会被发送前复核发现并丢弃；快照之前发生的变更则体现在随后读到的
+        记忆与材料里——两个方向都不会把已撤回的数据放进请求。
+
+        记忆块与材料块都只进 `extra_user_content_parts` 并标记为临时，历史只进 `contexts`，
+        三者都不进 system；预算不够时的裁剪顺序见 `trim_to_budget`（先丢群聊材料）。
         """
         group = self._group_key(facts)
+        revision = self._revision_snapshot(services, group, facts.sender_id)
+        memory_block = self._memory_block(services, group, facts.sender_id)
         materials = context_assembly.render_materials(
             services.context_buffer.entries(group),
             exclude_message_id=message_id,
@@ -627,20 +638,49 @@ class ChizuruPlugin(Star):
             materials=materials,
             history_turns=await self._load_history(event, settings, services),
             budget=settings.budget.input_token_budget,
+            memory_block=memory_block,
         )
         if trimmed is None:
             return None
-        parts: tuple[object, ...] = ()
-        if trimmed.materials is not None:
-            # part 级临时标记（K6）：框架若把这一轮交给持久化，注入片段会被剔除。
-            parts = (TextPart(text=trimmed.materials).mark_as_temp(),)
+        parts: list[object] = []
+        for text in (trimmed.memory, trimmed.materials):
+            if text is not None:
+                # part 级临时标记（K6）：框架若把这一轮交给持久化，注入片段会被剔除。
+                parts.append(TextPart(text=text).mark_as_temp())
         plan = context_assembly.build_chat_plan(
             user_text=facts.direct_text,
             max_retries=settings.limits.max_retries,
-            dynamic_parts=parts,
+            dynamic_parts=tuple(parts),
             contexts=trimmed.contexts,
         )
-        return _ChatPreparation(plan=plan, revision=self._revision_snapshot(services, group, facts.sender_id))
+        return _ChatPreparation(
+            plan=plan,
+            revision=revision,
+            memory_used=trimmed.memory is not None,
+        )
+
+    def _memory_block(
+        self,
+        services: _Services,
+        group: GroupKey,
+        member_id: str,
+    ) -> context_assembly.TextBlock | None:
+        """读本人记忆并渲染成注入块；未授权、无存储或读失败一律**不注入**。
+
+        查询键由可信事件元数据构造（群 + 当前发言者），没有任何"按 ID 查他人"的入口。
+        读失败不置降级也不影响聊天：这一轮退回普通聊天（降级可见性属 S3-11）。
+        """
+        stored = services.storage
+        if stored is None or stored.database.failed:
+            return None
+        member = MemberKey(group, member_id)
+        try:
+            if not stored.memories.state(member).authorized:
+                return None
+            facts = memory.retrieve(stored.memories, member)
+        except storage.StorageFailure:
+            return None
+        return memory.render_block(facts)
 
     async def _load_history(
         self,

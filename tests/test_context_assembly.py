@@ -9,6 +9,7 @@ from astrbot_plugin_chizuru.context_assembly import (
     STATIC_RULES,
     LabelMap,
     Materials,
+    TextBlock,
     build_chat_plan,
     escape_nickname,
     estimate_tokens,
@@ -342,6 +343,97 @@ class TrimToBudgetTests(unittest.TestCase):
                 budget=200,
             )
         )
+
+    def memory_block(self, count=3):
+        return TextBlock(
+            title="【本人记忆·临时材料】",
+            lines=tuple(f"· 本人希望的称呼：第 {index} 条" for index in range(count)),
+        )
+
+    def test_memory_block_is_injected_when_the_budget_is_ample(self):
+        result = trim_to_budget(
+            system_prompt=STATIC_RULES,
+            user_text="今天有点累",
+            materials=self.materials(2),
+            history_turns=self.turns(1),
+            budget=8192,
+            memory_block=self.memory_block(3),
+        )
+        assert result is not None
+        self.assertIsNotNone(result.memory)
+        self.assertTrue((result.memory or "").startswith("【本人记忆·临时材料】"))
+        self.assertIn("第 2 条", result.memory or "")
+
+    def test_a_memory_block_without_lines_is_ignored(self):
+        result = trim_to_budget(
+            system_prompt=STATIC_RULES,
+            user_text="问",
+            materials=self.materials(1),
+            history_turns=(),
+            budget=8192,
+            memory_block=TextBlock(title="【本人记忆·临时材料】"),
+        )
+        assert result is not None
+        self.assertIsNone(result.memory)
+
+    def test_materials_are_dropped_before_the_memory_block(self):
+        # 预算刚好放得下记忆块 + 标题，放不下群聊材料：这是"先裁群聊材料"的判据。
+        base = estimate_tokens(STATIC_RULES) + estimate_tokens("问") + context_assembly.LINE_OVERHEAD_TOKENS
+        memory_cost = (
+            estimate_tokens("【本人记忆·临时材料】")
+            + estimate_tokens("· 本人希望的称呼：第 0 条")
+            + 2 * context_assembly.LINE_OVERHEAD_TOKENS
+        )
+        result = trim_to_budget(
+            system_prompt=STATIC_RULES,
+            user_text="问",
+            materials=self.materials(5),
+            history_turns=self.turns(3),
+            budget=base + memory_cost + 1,
+            memory_block=self.memory_block(1),
+        )
+        assert result is not None
+        self.assertIsNotNone(result.memory)
+        self.assertIsNone(result.materials)
+        self.assertEqual(result.contexts, ())
+
+    def test_oldest_memory_lines_are_dropped_first(self):
+        block = self.memory_block(6)
+        base = estimate_tokens(STATIC_RULES) + estimate_tokens("问") + context_assembly.LINE_OVERHEAD_TOKENS
+        result = trim_to_budget(
+            system_prompt=STATIC_RULES,
+            user_text="问",
+            materials=None,
+            history_turns=(),
+            # 标题与每行各有一次行开销：预算刚好放得下 3 行。
+            budget=base
+            + estimate_tokens("【本人记忆·临时材料】")
+            + context_assembly.LINE_OVERHEAD_TOKENS
+            + 3
+            * (
+                estimate_tokens("· 本人希望的称呼：第 0 条")
+                + context_assembly.LINE_OVERHEAD_TOKENS
+            ),
+            memory_block=block,
+        )
+        assert result is not None
+        kept = (result.memory or "").splitlines()[1:]
+        self.assertEqual(len(kept), 3)
+        self.assertIn("第 5 条", kept[-1])
+        self.assertNotIn("第 0 条", kept)
+
+    def test_history_survives_after_the_memory_block(self):
+        result = trim_to_budget(
+            system_prompt=STATIC_RULES,
+            user_text="问",
+            materials=None,
+            history_turns=self.turns(2),
+            budget=8192,
+            memory_block=self.memory_block(1),
+        )
+        assert result is not None
+        self.assertIsNotNone(result.memory)
+        self.assertEqual(len(result.contexts), 4)
 
     def test_keeps_everything_when_budget_is_ample(self):
         result = trim_to_budget(

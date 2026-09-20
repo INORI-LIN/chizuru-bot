@@ -216,6 +216,34 @@ class AssemblyTestCase(unittest.IsolatedAsyncioTestCase):
         budget = sys.modules["astrbot_plugin_chizuru.budget"]
         return plugin_module.PriceTable({model: budget.TokenPrice(Decimal("1"), Decimal("1"))})
 
+    def memory_limits(self):
+        return plugin_module.storage.MemoryLimits(max_records=20, ttl_seconds=90 * 24 * 3600)
+
+    def seed_fact(self, *, member_id: str = "30001", category: str = "address", content: str = "叫我小林",
+                  source: str = "seed-1"):
+        """预置一条本人记录（需先授权）；授权流程本身由 S3-03 交付。"""
+        member = plugin_module.MemberKey(self.group_key(), member_id)
+        written = self.plugin.services.storage.memories.record_auto_facts(
+            member,
+            facts=[(category, content)],
+            source_message_id=source,
+            limits=self.memory_limits(),
+        )
+        return written
+
+    async def start_extraction(self, *, provider, authorized: bool = True, paused: bool = False, **overrides):
+        """打开抽取所需的配置与注入点；`overrides` 原样透传给 `start`。"""
+        overrides.setdefault("config", self.extraction_config())
+        overrides.setdefault("storage_path", self.new_storage_path())
+        overrides.setdefault("price_table", self.price_table())
+        await self.start(provider=provider, **overrides)
+        if authorized:
+            self.authorize_memory()
+        if paused:
+            self.open_group()
+            self.plugin.services.storage.groups.set_paused(self.group_key(), paused=True)
+        return provider
+
     def plain(self, text="今天天气不错", **overrides):
         return self.event([factory.Plain(text)], **overrides)
 
@@ -1630,28 +1658,6 @@ class MemoryExtractionTests(AssemblyTestCase):
     "已授权的链路"与"未授权一律不抽取"。
     """
 
-    async def start_extraction(
-        self,
-        *,
-        provider,
-        authorized: bool = True,
-        paused: bool = False,
-        config=None,
-        **overrides,
-    ):
-        await self.start(
-            provider=provider,
-            config=config or self.extraction_config(**overrides),
-            storage_path=self.new_storage_path(),
-            price_table=self.price_table(),
-        )
-        if authorized:
-            self.authorize_memory()
-        if paused:
-            self.open_group()
-            self.plugin.services.storage.groups.set_paused(self.group_key(), paused=True)
-        return provider
-
     async def test_extraction_stays_off_by_default(self):
         provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="嗯，我在。")])
         await self.start(provider=provider, storage_path=self.new_storage_path())
@@ -1778,6 +1784,135 @@ class MemoryExtractionTests(AssemblyTestCase):
         snapshot = self.plugin.services.health.snapshot()
         self.assertEqual((snapshot.extraction_successes, snapshot.extraction_failures), (1, 0))
         self.assertEqual(self.memory_facts(), ())
+
+
+class MutatingSecondCallProvider(fakes.FakeProvider):
+    """在**第二次**调用（抽取）之前执行一次副作用：制造"抽取在途时记忆被纠正"的竞态。"""
+
+    def __init__(self, *, action=None, **kwargs):
+        super().__init__(**kwargs)
+        self.action = action
+        self.acted = False
+
+    async def text_chat(self, **kwargs):
+        if self.action is not None and not self.acted and len(self.calls) == 1:
+            self.acted = True
+            self.action()
+        return await super().text_chat(**kwargs)
+
+
+class MemoryInjectionTests(AssemblyTestCase):
+    """S3-08/S3-09：记忆注入的隔离、记忆辅助轮的排除、在途变更的确定性丢弃。"""
+
+    async def test_the_memory_block_is_injected_as_a_temp_part(self):
+        provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="嗯，我在。")])
+        await self.start_extraction(provider=provider)
+        self.authorize_memory()
+        self.seed_fact(content="小林")
+
+        await self.plugin.on_message(self.mention("我今天有点累", message_id="m-1"))
+
+        parts = list(provider.calls[0]["extra_user_content_parts"])
+        memory = [part for part in parts if "【本人记忆·临时材料】" in part.text]
+        self.assertEqual(len(memory), 1)
+        self.assertIn("· 本人希望的称呼：小林", memory[0].text)
+        # 注入片段是临时 part：框架若把这一轮交给持久化会被剔除（K6）。
+        self.assertIs(getattr(memory[0], "_no_save", False), True)
+        # 记忆只落 user 侧的临时 part，结构上不进 system，也不进历史 contexts。
+        self.assertNotIn("小林", provider.calls[0]["system_prompt"])
+        self.assertEqual(provider.calls[0]["contexts"], [])
+
+    async def test_the_memory_assisted_turn_is_not_written_back(self):
+        provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="嗯，我在。")])
+        store = fakes.FakeHistoryStore()
+        await self.start_extraction(provider=provider, history_store=store)
+        self.authorize_memory()
+        self.seed_fact()
+
+        await self.plugin.on_message(self.mention("你好", message_id="m-1"))
+
+        self.assertEqual(len(self.sent), 1)
+        # G03-③：用了长期记忆的那一轮**不写回共享历史**（需求 §4.3）。
+        self.assertEqual(store.saves, [])
+
+    async def test_a_turn_without_memory_is_still_written_back(self):
+        provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="嗯，我在。")])
+        store = fakes.FakeHistoryStore()
+        await self.start_extraction(provider=provider, history_store=store)
+        self.authorize_memory()  # 已授权但没有记录 → 不注入
+
+        await self.plugin.on_message(self.mention("你好", message_id="m-1"))
+
+        self.assertEqual(len(store.saves), 1)
+        self.assertEqual(store.saves[0][0], "qq-local:GroupMessage:20001")
+
+    async def test_an_unauthorized_member_gets_no_memory(self):
+        provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="嗯，我在。")])
+        await self.start_extraction(provider=provider)
+        self.authorize_memory(member_id="30002")
+        self.seed_fact(member_id="30002", content="别人的记录")
+
+        await self.plugin.on_message(self.mention("你好", message_id="m-1"))
+
+        parts = "".join(part.text for part in provider.calls[0]["extra_user_content_parts"])
+        self.assertNotIn("别人的记录", parts)
+        self.assertNotIn("【本人记忆·临时材料】", parts)
+
+    async def test_expired_records_are_not_injected(self):
+        provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="嗯，我在。")])
+        await self.start_extraction(provider=provider)
+        self.authorize_memory()
+        self.seed_fact()
+        self.clock.advance(91 * 24 * 3600)
+
+        await self.plugin.on_message(self.mention("你好", message_id="m-1"))
+
+        parts = "".join(part.text for part in provider.calls[0]["extra_user_content_parts"])
+        self.assertNotIn("【本人记忆·临时材料】", parts)
+
+    async def test_a_midflight_correction_drops_the_extraction_write(self):
+        member = plugin_module.MemberKey(self.group_key(), "30001")
+        provider = MutatingSecondCallProvider(
+            script=[
+                fakes.FakeLLMResponse(text="嗯，我在。"),
+                fakes.FakeLLMResponse(text='[{"category": "interest", "content": "看番"}]'),
+            ],
+            action=lambda: self.plugin.services.storage.memories.correct(
+                member, 1, content="改过的称呼"
+            ),
+        )
+        await self.start_extraction(provider=provider)
+        self.authorize_memory()
+        self.seed_fact(content="小林")
+
+        await self.plugin.on_message(self.mention("我喜欢看番", message_id="m-1"))
+
+        # 回复照旧送达，但抽取写回被修订复核丢弃：旧任务不写回、不自动重做。
+        self.assertEqual(len(self.sent), 1)
+        facts = self.memory_facts()
+        self.assertEqual([(f.record_id, f.content) for f in facts], [(1, "改过的称呼")])
+        self.assertEqual(len(provider.calls), 2)
+
+    async def test_a_midflight_revocation_drops_the_reply(self):
+        member = plugin_module.MemberKey(self.group_key(), "30001")
+        provider = MutatingProvider(
+            script=[fakes.FakeLLMResponse(text="嗯，我在。")],
+            action=lambda: self.plugin.services.storage.memories.set_authorized(
+                member, authorized=False, auth_version="auth-1"
+            ),
+        )
+        store = fakes.FakeHistoryStore()
+        await self.start_extraction(provider=provider, history_store=store)
+        self.authorize_memory()
+        self.seed_fact()
+
+        await self.plugin.on_message(self.mention("你好", message_id="m-1"))
+
+        # 撤回授权让成员修订号 +1：在途回复不发送、不写历史，且不自动重做。
+        self.assertEqual(self.sent, [])
+        self.assertEqual(store.saves, [])
+        self.assertEqual(len(provider.calls), 1)
+        self.assertFalse(self.plugin.services.storage.memories.state(member).authorized)
 
 
 if __name__ == "__main__":
