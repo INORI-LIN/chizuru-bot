@@ -1915,5 +1915,105 @@ class MemoryInjectionTests(AssemblyTestCase):
         self.assertFalse(self.plugin.services.storage.memories.state(member).authorized)
 
 
+class MemoryRobustnessTests(AssemblyTestCase):
+    """S3-11/S3-12：恶意与慢速提供商、降级可用性与状态可见性。"""
+
+    async def test_a_foreign_owner_field_cannot_move_a_fact(self):
+        provider = fakes.FakeProvider(
+            script=[
+                fakes.FakeLLMResponse(text="嗯，我在。"),
+                fakes.FakeLLMResponse(
+                    text='[{"category": "interest", "content": "看番",'
+                    ' "member_id": "99999", "authorized": true}]'
+                ),
+            ]
+        )
+        await self.start_extraction(provider=provider)
+        await self.plugin.on_message(self.mention("我喜欢看番", message_id="m-1"))
+
+        # 记录落在提问者名下：模型给的 member_id 既不被采用也不影响写入。
+        self.assertEqual([fact.content for fact in self.memory_facts()], ["看番"])
+        self.assertEqual(self.memory_facts("99999"), ())
+
+    async def test_sensitive_content_never_reaches_the_store(self):
+        provider = fakes.FakeProvider(
+            script=[
+                fakes.FakeLLMResponse(text="嗯，我在。"),
+                fakes.FakeLLMResponse(text='[{"category": "address", "content": "我的手机号 13800138000"}]'),
+            ]
+        )
+        await self.start_extraction(provider=provider)
+        await self.plugin.on_message(self.mention("你好", message_id="m-1"))
+
+        self.assertEqual(self.memory_facts(), ())
+        self.assertEqual(self.plugin.services.health.snapshot().extraction_failures, 1)
+
+    async def test_an_extraction_failure_is_visible_and_chat_keeps_working(self):
+        provider = fakes.FakeProvider(
+            script=[
+                fakes.FakeLLMResponse(text="嗯，我在。"),
+                fakes.FakeApiError(500, "provider down"),
+                fakes.FakeApiError(500, "provider down"),
+                fakes.FakeLLMResponse(text="嗯，在的。"),
+                fakes.FakeLLMResponse(text="[]"),
+            ]
+        )
+        await self.start_extraction(provider=provider)
+        await self.plugin.on_message(self.mention("你好", message_id="m-1"))
+
+        suspended = plugin_module.health.Degradation.EXTRACTION_SUSPENDED
+        self.assertIn(suspended, self.plugin.services.health.degradations())
+
+        await self.plugin.on_message(self.mention("千鹤 状态", message_id="status-1"))
+        report = text_of(self.sent[-1])
+        self.assertIn("抽取：成功 0 次，失败 1 次", report)
+        self.assertIn("抽取已暂停（聊天不受影响）", report)
+
+        # 聊天不受抽取失败影响；下一次抽取成功即清除标志。
+        await self.plugin.on_message(self.mention("在吗", message_id="m-2"))
+        self.assertNotIn(suspended, self.plugin.services.health.degradations())
+        self.assertIn("嗯，在的。", [text_of(message) for message in self.sent])
+
+    async def test_a_degraded_store_stops_memory_but_keeps_chat(self):
+        provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="嗯，我在。")])
+        await self.start_extraction(provider=provider)
+        self.authorize_memory()
+        self.seed_fact()
+        self.plugin.services.health.set_degraded(plugin_module.health.Degradation.MEMORY_STORE_FAILED)
+
+        await self.plugin.on_message(self.mention("你好", message_id="m-1"))
+
+        # D12：库不可用时退回普通聊天——不注入记忆、不抽取，但回复照常送达。
+        parts = "".join(part.text for part in provider.calls[0]["extra_user_content_parts"])
+        self.assertNotIn("【本人记忆·临时材料】", parts)
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(len(self.sent), 1)
+
+    async def test_a_slow_model_keeps_a_revocation_effective(self):
+        provider = BlockingProvider()
+        store = fakes.FakeHistoryStore()
+        await self.start_extraction(provider=provider, history_store=store)
+        self.authorize_memory()
+        self.seed_fact()
+        member = plugin_module.MemberKey(self.group_key(), "30001")
+
+        event = self.mention("你好", message_id="m-1")
+        sent = self.sent
+        running = asyncio.create_task(self.plugin.on_message(event))
+        try:
+            await provider.started.wait()
+            self.plugin.services.storage.memories.set_authorized(
+                member, authorized=False, auth_version="auth-1"
+            )
+        finally:
+            provider.release.set()
+            await running
+
+        # A10：模型在途时撤回授权 → 结果既不发送、也不落历史，且不自动重做。
+        self.assertEqual(sent, [])
+        self.assertEqual(store.saves, [])
+        self.assertEqual(len(provider.calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

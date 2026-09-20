@@ -442,14 +442,8 @@ class ChizuruPlugin(Star):
         不采集"不依赖任何默认放行（S2-02 落地前后同样成立）。群开关的临时来源
         （部署配置）不参与采集判定——采集要求告知，聊天不要求。
         """
-        stored = services.storage
-        if stored is None or stored.database.failed:
-            return None
-        if services.health.degradations() & {
-            health.Degradation.MEMORY_STORE_FAILED,
-            health.Degradation.DELETION_FAILED,
-        }:
-            # 无法确认退出/删除状态时停止采集（架构 §8.3）。
+        stored = self._memory_store(services)
+        if stored is None:
             return None
         if not is_trusted_scope(facts, settings):
             return None
@@ -479,6 +473,24 @@ class ChizuruPlugin(Star):
             shape=shape,
             nickname=self._sender_nickname(event),
         )
+
+    @staticmethod
+    def _memory_store(services: _Services) -> storage.Storage | None:
+        """可读写的记忆库；无存储、库已失败或已置降级时返回 ``None``（架构 §8.3）。
+
+        三个调用点共用本判定：采集准入、记忆注入、抽取准入。"无法确认退出/删除状态时
+        停止受影响的动作"因此只有一处表达。
+        """
+        stored = services.storage
+        if stored is None or stored.database.failed:
+            return None
+        blocking = {
+            health.Degradation.MEMORY_STORE_FAILED,
+            health.Degradation.DELETION_FAILED,
+        }
+        if services.health.degradations() & blocking:
+            return None
+        return stored
 
     @staticmethod
     def _sender_nickname(event: AstrMessageEvent) -> str:
@@ -668,10 +680,11 @@ class ChizuruPlugin(Star):
         """读本人记忆并渲染成注入块；未授权、无存储或读失败一律**不注入**。
 
         查询键由可信事件元数据构造（群 + 当前发言者），没有任何"按 ID 查他人"的入口。
-        读失败不置降级也不影响聊天：这一轮退回普通聊天（降级可见性属 S3-11）。
+        库不可用（无存储、库失败或已降级）时**不注入**；读失败同样只退回普通聊天，
+        不置降级也不阻断回复——记忆不是聊天的前置条件（S3-11，与 R21 同向）。
         """
-        stored = services.storage
-        if stored is None or stored.database.failed:
+        stored = self._memory_store(services)
+        if stored is None:
             return None
         member = MemberKey(group, member_id)
         try:
@@ -875,9 +888,9 @@ class ChizuruPlugin(Star):
             # 默认关闭（总开关关闭或预算未配置）：连存储都不读。判定仍由 `memory.admit`
             # 收口，这里只是避免在"从不会抽取"的部署里每轮多读两次库。
             return
-        stored = services.storage
-        if stored is None or stored.database.failed:
-            return  # 无存储 = 记忆子系统在结构上不存在（R21），不是错误
+        stored = self._memory_store(services)
+        if stored is None:
+            return  # 无存储或已降级 = 记忆子系统不可用（R21、S3-11），不是错误
         group = self._group_key(facts)
         member = MemberKey(group, facts.sender_id)
         admission = memory.admit(
@@ -910,7 +923,7 @@ class ChizuruPlugin(Star):
             return
         except DeadlineExceeded:
             services.budget.settle(reservation, None)
-            services.health.record_extraction_failure()
+            self._mark_extraction_health(services, failed=True)
             self._audit(
                 services,
                 redact.EventCategory.MEMORY_OP,
@@ -925,9 +938,9 @@ class ChizuruPlugin(Star):
         if result.usage is not None:
             self._audit(services, redact.EventCategory.TOKEN_USAGE, tokens=result.usage)
         if memory.counts_as_failure(result):
-            services.health.record_extraction_failure()
+            self._mark_extraction_health(services, failed=True)
         else:
-            services.health.record_extraction_success()
+            self._mark_extraction_health(services, failed=False)
         self._write_memory(
             stored,
             services,
@@ -983,6 +996,20 @@ class ChizuruPlugin(Star):
                 if outcome.outcome is memory.WriteOutcome.REVISION_CHANGED
                 else None,
             )
+
+    @staticmethod
+    def _mark_extraction_health(services: _Services, *, failed: bool) -> None:
+        """抽取的计数与可见标志（S3-11）：失败置位、成功清除。
+
+        **标志不阻断抽取**——它是"最近一次抽取没成功"的可见标记，若拿它当门禁就永远无法
+        清除（与 `PROVIDER_DISABLED` 同例：由成功来清）。阈值判断不在本模块，`health` 只计数。
+        """
+        if failed:
+            services.health.record_extraction_failure()
+            services.health.set_degraded(health.Degradation.EXTRACTION_SUSPENDED)
+        else:
+            services.health.record_extraction_success()
+            services.health.clear_degraded(health.Degradation.EXTRACTION_SUSPENDED)
 
     def _reserve_extraction(self, services: _Services, provider: object) -> Reservation | None:
         """抽取的预留；被拒绝即不发起调用（与聊天同一顺序：先预留、再调度）。"""
