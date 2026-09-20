@@ -1,11 +1,15 @@
 """成员在普通群上下文中的退出与加入状态。
 
-**与长期记忆授权无关**：本表没有授权列，退出与加入都不触碰 S3 的记忆数据。
-"不改变本人的长期记忆授权"是表结构的事实，不是实现纪律。
+**与长期记忆授权无关**：本表没有授权列（记忆授权在 ``memory_state`` 里），退出与加入
+都不触碰记忆数据。"不改变本人的长期记忆授权"是表结构的事实，不是实现纪律。
 
 无行 = 未退出；采集是否开启由群策略决定，本表只回答"这个人是否要求停止采集
 本人的普通群聊"。退出会清理本人缓冲与相关群历史（由 main 执行）并增加群修订号；
 加入要求本群已告知且未关闭、未暂停（需求 §4.4），且不恢复旧材料。
+
+``revision`` 是**成员数据修订号**，不只属于上下文退出：记忆授权变更、纠正与删除也在
+同一事务内让它 +1（``bump_member_revision``，架构 §6.2）。这样在途结果失效的判定只需
+比较 ``RevisionSnapshot`` 的两侧，不需要第二个计数器。
 """
 
 from __future__ import annotations
@@ -60,6 +64,29 @@ def read_member_state(connection: sqlite3.Connection, member: MemberKey) -> Memb
         opted_out=bool(row["context_opt_out"]),
         revision=int(row["revision"]),
     )
+
+
+def bump_member_revision(connection: sqlite3.Connection, member: MemberKey, *, at: int) -> int:
+    """成员修订号 +1（无行则以未退出状态建行，revision 从 1 起）；在调用方事务内使用。
+
+    记忆授权变更、纠正与删除都必须先增成员修订号，让在途聊天与抽取结果失效（架构 §6.2）。
+    建出的行 ``context_opt_out = 0``，与"从未退出"在语义上等价。
+    """
+    row = connection.execute(_SELECT_REVISION, key_params(member)).fetchone()
+    if row is None:
+        connection.execute(
+            "INSERT INTO member_state (platform_id, self_id, group_id, member_id, "
+            "context_opt_out, revision, updated_at) VALUES (?, ?, ?, ?, 0, 1, ?)",
+            (*key_params(member), at),
+        )
+        return 1
+    revision = int(row["revision"]) + 1
+    connection.execute(
+        "UPDATE member_state SET revision = ?, updated_at = ? "
+        "WHERE platform_id = ? AND self_id = ? AND group_id = ? AND member_id = ?",
+        (revision, at, *key_params(member)),
+    )
+    return revision
 
 
 class MemberStore:
@@ -153,6 +180,12 @@ class MemberStore:
                 group_revision=policy.revision,
                 changed=True,
             )
+
+
+_SELECT_REVISION = (
+    "SELECT revision FROM member_state "
+    "WHERE platform_id = ? AND self_id = ? AND group_id = ? AND member_id = ?"
+)
 
 
 def _read_row(connection: sqlite3.Connection, member: MemberKey) -> sqlite3.Row | None:

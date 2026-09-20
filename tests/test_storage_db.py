@@ -1,4 +1,4 @@
-"""S2-01 存储基础（db/schema）离线测试：延迟建库、短事务、失败不恢复。"""
+"""S2-01 + S3-01 存储基础（db/schema）离线测试：延迟建库、短事务、失败不恢复、升版。"""
 
 import ast
 import os
@@ -12,6 +12,32 @@ from astrbot_plugin_chizuru.storage import DB_FILE_NAME, Database, StorageFailur
 ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_ROOT = ROOT / "astrbot_plugin_chizuru"
 WORK_ROOT = ROOT / ".runtime"
+
+EXPECTED_TABLES = {
+    "group_policy",
+    "member_state",
+    "memory_state",
+    "memory_fact",
+    "memory_source",
+}
+"""结构版本 2 的**完整**表集合；精确相等（而不是包含），多一张少一张都要改这里。"""
+
+_VERSION_1_GROUP_POLICY = """
+CREATE TABLE group_policy (
+    platform_id     TEXT    NOT NULL,
+    self_id         TEXT    NOT NULL,
+    group_id        TEXT    NOT NULL,
+    context_enabled INTEGER NOT NULL DEFAULT 0 CHECK (context_enabled IN (0, 1)),
+    paused          INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1)),
+    notice_version  TEXT    NOT NULL DEFAULT '',
+    notice_at       INTEGER,
+    notice_by       TEXT    NOT NULL DEFAULT '',
+    revision        INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY (platform_id, self_id, group_id)
+) STRICT
+"""
+"""结构版本 1 的群策略表原文（冻结自 0.19 版 ``schema.py``），用于升版用例。"""
 
 
 class StorageDbTestCase(unittest.TestCase):
@@ -50,7 +76,7 @@ class LazyCreationTests(StorageDbTestCase):
                 "VALUES ('qq-local', '10001', '20001', 1)"
             )
         self.assertTrue(self.path.exists())
-        self.assertEqual(self.table_names(), {"group_policy", "member_state"})
+        self.assertEqual(self.table_names(), EXPECTED_TABLES)
         with self.database.read() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
         self.assertEqual(version, schema.SCHEMA_VERSION)
@@ -76,7 +102,46 @@ class LazyCreationTests(StorageDbTestCase):
                 "INSERT INTO member_state (platform_id, self_id, group_id, member_id, updated_at) "
                 "VALUES ('qq-local', '10001', '20001', '30001', 1)"
             )
-        self.assertEqual(self.table_names(), {"group_policy", "member_state"})
+        self.assertEqual(self.table_names(), EXPECTED_TABLES)
+
+
+class MigrationTests(StorageDbTestCase):
+    def make_version_1_database(self) -> None:
+        """手工造一个结构版本 1 的库（只有群策略表与一行数据）。"""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(str(self.path))
+        connection.execute(_VERSION_1_GROUP_POLICY)
+        connection.execute(
+            "INSERT INTO group_policy (platform_id, self_id, group_id, context_enabled, "
+            "notice_version, revision, updated_at) VALUES ('qq-local', '10001', '20001', 1, "
+            "'notice-1', 7, 1)"
+        )
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+        connection.close()
+
+    def test_version_1_is_uninitialized_before_the_first_write(self):
+        self.make_version_1_database()
+        # 降级为"无状态"而不是报错：版本不等即未初始化（schema 模块头记录的代价）。
+        self.database.probe()
+        with self.database.read() as connection:
+            self.assertIsNone(connection)
+
+    def test_first_write_adds_the_new_tables_and_keeps_the_old_rows(self):
+        self.make_version_1_database()
+        with self.database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO member_state (platform_id, self_id, group_id, member_id, updated_at) "
+                "VALUES ('qq-local', '10001', '20001', '30001', 1)"
+            )
+        self.assertEqual(self.table_names(), EXPECTED_TABLES)
+        with self.database.read() as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            policy = connection.execute(
+                "SELECT revision, context_enabled FROM group_policy WHERE group_id = '20001'"
+            ).fetchone()
+        self.assertEqual(version, schema.SCHEMA_VERSION)
+        self.assertEqual((policy["revision"], policy["context_enabled"]), (7, 1))
 
 
 class FailureTests(StorageDbTestCase):
@@ -178,7 +243,7 @@ class PathValidationTests(unittest.TestCase):
 
 class StructuralTests(unittest.TestCase):
     def test_storage_modules_are_synchronous_and_framework_free(self):
-        for name in ("__init__.py", "db.py", "schema.py", "groups.py", "members.py"):
+        for name in ("__init__.py", "db.py", "schema.py", "groups.py", "members.py", "memories.py"):
             with self.subTest(module=name):
                 tree = ast.parse((PLUGIN_ROOT / "storage" / name).read_text(encoding="utf-8"))
                 imports = {
