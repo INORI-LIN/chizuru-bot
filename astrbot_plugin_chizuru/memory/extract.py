@@ -24,6 +24,7 @@ from enum import StrEnum
 
 from ..budget import TokenUsage
 from ..llm import (
+    Answer,
     AnswerKind,
     LLMRequestPlan,
     ResponseFacts,
@@ -177,7 +178,17 @@ def parse_candidates(payload: str) -> tuple[Candidate, ...] | None:
 
 def extract(facts: ResponseFacts) -> ExtractionResult:
     """把提供商的响应事实变成抽取结论（纯函数，不发送、不写库）。"""
-    answer = interpret(facts)
+    return from_answer(interpret(facts))
+
+
+def from_answer(answer: Answer) -> ExtractionResult:
+    """把已经解释过的 ``llm.Answer`` 变成抽取结论。
+
+    装配层的重试循环与聊天共用（同一个 ``llm.RetryPolicy`` 与同一个 ``Deadline``），
+    循环内只需要一次解释，因此这里接受 ``Answer`` 而不是响应对象。
+    """
+    if not isinstance(answer, Answer):
+        raise ValueError("answer 必须是 llm.Answer")
     if answer.kind is AnswerKind.FAILED:
         return ExtractionResult(
             status=ExtractionStatus.FAILED,

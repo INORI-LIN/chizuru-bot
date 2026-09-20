@@ -49,6 +49,10 @@
   降级为"无存储"，采集与退出/加入保持关闭，`千鹤 状态` 可见。
 - 去重窗口与容量是装配层常量，标注"建议参数待评审"——取值依赖仍未在线核验的 O-07。
 - 聊天失败不发任何群内提示：同样的理由（架构 §8.3 的失败文案属 S4-01）。
+- 记忆抽取（S3-07/S3-10）接在**回复流程之后**、同一次事件处理内 `await`（不建游离任务，
+  以保住装配测试的"无新增任务"不变量）：准入看授权位、暂停、总开关与预算门槛；写回在
+  单个短事务内重核修订号与授权、按"源消息 + 动作"去重。**这条路径没有任何出站**，
+  失败只记审计与计数，不影响已发送的回复。授权版本比对与成员授权入口属 S3-03。
 - `limits` 与 `budget` 在 `initialize()` 时固定，运行时改动需重载插件；身份、允许群、
   维护者映射与金额开关每个事件重读（配置变更即时生效）。
 
@@ -83,7 +87,7 @@ from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.agent.message import TextPart
 from astrbot.core.platform.message_type import MessageType
 
-from . import commands, context_assembly, health, history, llm, notice, redact, storage
+from . import commands, context_assembly, health, history, llm, memory, notice, redact, storage
 from .budget import BudgetLedger, BudgetRefusal, BudgetRefused, PriceTable, Reservation, UsageKind
 from .config import Settings
 from .context_buffer import BufferShape, ContextBuffer, IngestOutcome
@@ -223,6 +227,9 @@ class ChizuruPlugin(Star):
         self.history_cleaner: Callable[[str], Awaitable[None]] | None = None
         self.history_store: object | None = None
         """互动历史存储（S2-07）的测试注入点；默认用 `_ConversationHistory(context)`。"""
+        self.price_table: PriceTable | None = None
+        """价目表的测试注入点。生产恒为空价目表——**金额未配置前不接价目表**（R20：
+        空价目表 + 已配金额会让 `reserve` 保守拒绝，价目表来源的落地钉在 S4-01）。"""
 
     # ---- 生命周期 ----
 
@@ -240,7 +247,7 @@ class ChizuruPlugin(Star):
             ),
             budget=BudgetLedger(
                 settings.budget,
-                prices=PriceTable(),
+                prices=PriceTable() if self.price_table is None else self.price_table,
                 clock=self.datetime_clock,
             ),
             scheduler=Scheduler(settings.limits, monotonic=self.clock),
@@ -582,6 +589,14 @@ class ChizuruPlugin(Star):
             # `memory_assisted` 本批恒 False；S3-08 起为"本轮检索到长期记忆"。
             await self._record_history(event, facts, settings, services, answer.text, prepared.revision)
         services.dedup.finish(key, outcome)
+        await self._extract_memory(
+            facts,
+            settings,
+            services,
+            provider=provider,
+            message_id=message_id,
+            revision=prepared.revision,
+        )
 
     async def _prepare_chat(
         self,
@@ -720,7 +735,7 @@ class ChizuruPlugin(Star):
         services: _Services,
         deadline: Deadline,
     ) -> llm.Answer:
-        """一次聊天请求：直接调用提供商，最多重试 1 次且**共用同一个期限**。"""
+        """一次模型请求（聊天与抽取共用）：直接调用提供商，最多重试 1 次且**共用同一个期限**。"""
         policy = llm.RetryPolicy.from_limits(settings.limits)
         attempt = 0
         while True:
@@ -794,6 +809,187 @@ class ChizuruPlugin(Star):
         except Exception:
             return UNKNOWN_MODEL
         return name if isinstance(name, str) and name else UNKNOWN_MODEL
+
+    # ---- 记忆抽取（S3-07/S3-10） ----
+
+    async def _extract_memory(
+        self,
+        facts: MessageFacts,
+        settings: Settings,
+        services: _Services,
+        *,
+        provider: object,
+        message_id: str,
+        revision: RevisionSnapshot | None,
+    ) -> None:
+        """回复流程之后运行的后台抽取（S3-07/S3-10）。
+
+        **这条路径没有任何出站**：不调用 `_deliver`，也没有任何文案——"不产生已记住通知"
+        因此是结构事实。失败只记审计与计数，绝不抛出到处理器外：已送达的聊天不受影响。
+
+        准入的四种拒绝都是**静默且常态**的（未授权、已暂停、总开关关闭、预算未配置），
+        所以不逐条写审计——它们是默认状态而非异常，逐条记录只会把日志淹掉；维护者从
+        `千鹤 状态` 的预算行与配置即可看到。
+        """
+        if not settings.memory.extraction_enabled or not services.budget.extraction_allowed:
+            # 默认关闭（总开关关闭或预算未配置）：连存储都不读。判定仍由 `memory.admit`
+            # 收口，这里只是避免在"从不会抽取"的部署里每轮多读两次库。
+            return
+        stored = services.storage
+        if stored is None or stored.database.failed:
+            return  # 无存储 = 记忆子系统在结构上不存在（R21），不是错误
+        group = self._group_key(facts)
+        member = MemberKey(group, facts.sender_id)
+        admission = memory.admit(
+            source_text=facts.direct_text,
+            authorized=self._memory_authorized(stored, member),
+            paused=self._group_paused(stored, group),
+            extraction_enabled=settings.memory.extraction_enabled,
+            budget_allows=services.budget.extraction_allowed,
+        )
+        if not admission.allowed:
+            return
+
+        plan = memory.build_request(
+            source_text=admission.source_text,
+            max_retries=settings.limits.max_retries,
+        )
+        reservation = self._reserve_extraction(services, provider)
+        if reservation is None:
+            return
+
+        try:
+            result = await services.scheduler.submit_extraction(
+                group,
+                lambda deadline: self._ask_extraction(provider, plan, settings, services, deadline),
+            )
+        except AdmissionRefused:
+            # 从未开始：额度可退，事件可重来（与聊天路径同一配对规则）。
+            services.budget.cancel(reservation)
+            self._audit(services, redact.EventCategory.MEMORY_OP, code=redact.ErrorCode.QUEUE_FULL)
+            return
+        except DeadlineExceeded:
+            services.budget.settle(reservation, None)
+            services.health.record_extraction_failure()
+            self._audit(
+                services,
+                redact.EventCategory.MEMORY_OP,
+                code=redact.ErrorCode.PROVIDER_UNAVAILABLE,
+            )
+            return
+        except asyncio.CancelledError:
+            services.budget.settle(reservation, None)
+            raise
+
+        services.budget.settle(reservation, result.usage)
+        if result.usage is not None:
+            self._audit(services, redact.EventCategory.TOKEN_USAGE, tokens=result.usage)
+        if memory.counts_as_failure(result):
+            services.health.record_extraction_failure()
+        else:
+            services.health.record_extraction_success()
+        self._write_memory(
+            stored,
+            services,
+            settings,
+            member,
+            result,
+            message_id=message_id,
+            revision=revision,
+        )
+
+    def _write_memory(
+        self,
+        stored: storage.Storage,
+        services: _Services,
+        settings: Settings,
+        member: MemberKey,
+        result: memory.ExtractionResult,
+        *,
+        message_id: str,
+        revision: RevisionSnapshot | None,
+    ) -> None:
+        """写回候选：**单个短事务**内重核修订号与授权、按来源去重（S3-07）。
+
+        修订号不一致、授权已撤回、来源已处理——三种都是"什么都不写"的确定性结论：只记
+        审计，**不重试、不重做**（S3-09 的机制面）。
+        """
+        plan = memory.WritePlan(
+            member=member,
+            source_message_id=message_id,
+            source_action=ActionKind.MEMORY_EXTRACT.value,
+            source_retention_seconds=int(DEDUP_WINDOW_SECONDS),
+            limits=self._memory_limits(settings),
+            candidates=memory.plan_candidates(result),
+            expected_revision=revision,
+        )
+        try:
+            with stored.database.transaction() as connection:
+                outcome = memory.write_back(connection, plan, at=self._now_epoch())
+        except storage.StorageFailure:
+            self._audit(
+                services,
+                redact.EventCategory.MEMORY_OP,
+                code=redact.ErrorCode.MEMORY_STORE_FAILED,
+            )
+            return
+        if outcome.outcome is memory.WriteOutcome.WRITTEN:
+            self._audit(services, redact.EventCategory.MEMORY_OP, count=outcome.written)
+        elif outcome.outcome is not memory.WriteOutcome.NOTHING_TO_WRITE:
+            self._audit(
+                services,
+                redact.EventCategory.MEMORY_OP,
+                code=redact.ErrorCode.REVISION_CHANGED
+                if outcome.outcome is memory.WriteOutcome.REVISION_CHANGED
+                else None,
+            )
+
+    def _reserve_extraction(self, services: _Services, provider: object) -> Reservation | None:
+        """抽取的预留；被拒绝即不发起调用（与聊天同一顺序：先预留、再调度）。"""
+        try:
+            return services.budget.reserve(UsageKind.EXTRACTION, self._model_name(provider))
+        except BudgetRefused as refused:
+            self._audit(
+                services,
+                redact.EventCategory.MEMORY_OP,
+                code=_budget_code(refused.reason),
+            )
+            return None
+
+    async def _ask_extraction(
+        self,
+        provider: object,
+        plan: llm.LLMRequestPlan,
+        settings: Settings,
+        services: _Services,
+        deadline: Deadline,
+    ) -> memory.ExtractionResult:
+        """一次抽取请求：与聊天共用 `_ask`（同一期限、同一重试策略），只换解释方式。"""
+        return memory.from_answer(await self._ask(provider, plan, settings, services, deadline))
+
+    @staticmethod
+    def _memory_authorized(stored: storage.Storage, member: MemberKey) -> bool:
+        """读授权位；**读不到一律按未授权处理**（后台写路径 fail-closed）。"""
+        try:
+            return stored.memories.state(member).authorized
+        except storage.StorageFailure:
+            return False
+
+    @staticmethod
+    def _group_paused(stored: storage.Storage, group: GroupKey) -> bool:
+        """本群是否已暂停；**读不到按已暂停处理**（架构 §8.3：不用"未知"换放行）。"""
+        try:
+            return stored.groups.policy(group).paused
+        except storage.StorageFailure:
+            return True
+
+    @staticmethod
+    def _memory_limits(settings: Settings) -> storage.MemoryLimits:
+        """把配置里的条数与天数转成存储层要的参数（天数 → 秒在这里完成）。"""
+        return storage.MemoryLimits(
+            max_records=settings.memory.max_records_per_member,
+            ttl_seconds=settings.memory.ttl_days * 24 * 3600,
+        )
 
     # ---- 控制：千鹤 状态 ----
 

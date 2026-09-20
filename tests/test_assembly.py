@@ -17,6 +17,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import ExitStack
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -144,6 +145,7 @@ class AssemblyTestCase(unittest.IsolatedAsyncioTestCase):
         storage_path=None,
         history_cleaner=None,
         history_store=None,
+        price_table=None,
         conversation_manager=None,
         message_history_manager=None,
     ):
@@ -162,6 +164,8 @@ class AssemblyTestCase(unittest.IsolatedAsyncioTestCase):
             self.plugin.history_cleaner = history_cleaner
         if history_store is not None:
             self.plugin.history_store = history_store
+        if price_table is not None:
+            self.plugin.price_table = price_table
         await self.plugin.initialize()
         return self.plugin
 
@@ -187,6 +191,30 @@ class AssemblyTestCase(unittest.IsolatedAsyncioTestCase):
 
     def collected(self, group_id: str = "20001"):
         return self.plugin.services.context_buffer.entries(self.group_key(group_id))
+
+    def authorize_memory(
+        self, member_id: str = "30001", *, group_id: str = "20001", version: str = "auth-1"
+    ):
+        """直接写授权行模拟 S3-03 完成两级授权；授权流程与记忆命令仍由 S3-03/S3-04 交付。"""
+        member = plugin_module.MemberKey(self.group_key(group_id), member_id)
+        return self.plugin.services.storage.memories.set_authorized(
+            member, authorized=True, auth_version=version
+        )
+
+    def memory_facts(self, member_id: str = "30001", *, group_id: str = "20001"):
+        member = plugin_module.MemberKey(self.group_key(group_id), member_id)
+        return self.plugin.services.storage.memories.facts(member)
+
+    def extraction_config(self, **overrides):
+        """打开抽取所需的配置：总开关 + 已配金额（否则抽取按设计保持关闭）。"""
+        values = {"memory_extraction_enabled": True, "daily_budget_amount": 10}
+        values.update(overrides)
+        return make_config(**values)
+
+    def price_table(self, model: str = "fake-model"):
+        """已知价格的价目表；生产恒为空价目表（R20 的线上落地属 S4-01）。"""
+        budget = sys.modules["astrbot_plugin_chizuru.budget"]
+        return plugin_module.PriceTable({model: budget.TokenPrice(Decimal("1"), Decimal("1"))})
 
     def plain(self, text="今天天气不错", **overrides):
         return self.event([factory.Plain(text)], **overrides)
@@ -1593,6 +1621,163 @@ class RestartAndIsolationTests(AssemblyTestCase):
             [entry.text for entry in self.collected("20001")],
             [],
         )
+
+
+class MemoryExtractionTests(AssemblyTestCase):
+    """S3-07/S3-10：回复之后的抽取——零额外出站、默认关闭、失败不影响已发送的聊天。
+
+    授权行由用例直接写入（`authorize_memory`）：**成员授权入口属 S3-03**，本批只验证
+    "已授权的链路"与"未授权一律不抽取"。
+    """
+
+    async def start_extraction(
+        self,
+        *,
+        provider,
+        authorized: bool = True,
+        paused: bool = False,
+        config=None,
+        **overrides,
+    ):
+        await self.start(
+            provider=provider,
+            config=config or self.extraction_config(**overrides),
+            storage_path=self.new_storage_path(),
+            price_table=self.price_table(),
+        )
+        if authorized:
+            self.authorize_memory()
+        if paused:
+            self.open_group()
+            self.plugin.services.storage.groups.set_paused(self.group_key(), paused=True)
+        return provider
+
+    async def test_extraction_stays_off_by_default(self):
+        provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="嗯，我在。")])
+        await self.start(provider=provider, storage_path=self.new_storage_path())
+        self.authorize_memory()  # 成员已授权也不改变默认关闭
+        await self.plugin.on_message(self.mention("叫我小林就好", message_id="m-1"))
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(self.memory_facts(), ())
+        self.assertEqual(len(self.sent), 1)
+
+    async def test_unset_budget_keeps_extraction_closed(self):
+        provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="嗯，我在。")])
+        await self.start_extraction(
+            provider=provider, config=make_config(memory_extraction_enabled=True)
+        )
+        await self.plugin.on_message(self.mention("叫我小林就好", message_id="m-1"))
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(self.memory_facts(), ())
+
+    async def test_status_shows_extraction_closed_without_a_budget(self):
+        await self.start(
+            provider=fakes.FakeProvider(),
+            config=make_config(memory_extraction_enabled=True),
+        )
+        await self.plugin.on_message(self.mention("千鹤 状态", message_id="status-1"))
+        report = text_of(self.sent[0])
+        self.assertIn("未配置（自动抽取保持关闭）", report)
+        self.assertIn("抽取 关闭", report)
+
+    async def test_authorized_member_gets_a_fact_with_no_extra_outbound(self):
+        provider = fakes.FakeProvider(
+            script=[
+                fakes.FakeLLMResponse(text="嗯，我在。"),
+                fakes.FakeLLMResponse(text='[{"category": "address", "content": "叫我小林"}]'),
+            ]
+        )
+        await self.start_extraction(provider=provider)
+        await self.plugin.on_message(self.mention("叫我小林就好", message_id="m-1"))
+
+        self.assertEqual(len(provider.calls), 2)
+        extraction = provider.calls[1]
+        # 抽取请求与聊天请求完全隔离：独立提示、无历史、无动态材料、无工具。
+        self.assertEqual(extraction["prompt"], "叫我小林就好")
+        self.assertEqual(extraction["system_prompt"], plugin_module.memory.EXTRACTION_RULES)
+        self.assertEqual(extraction["contexts"], [])
+        self.assertEqual(extraction["extra_user_content_parts"], [])
+        for key in ("func_tool", "tool_choice"):
+            self.assertNotIn(key, extraction)
+
+        facts = self.memory_facts()
+        self.assertEqual([(fact.category, fact.content) for fact in facts], [("address", "叫我小林")])
+        # **不产生"已记住"通知**：出站仍然只有那一条聊天回复。
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(text_of(self.sent[0]), "嗯，我在。")
+
+    async def test_unauthorized_member_is_never_extracted(self):
+        provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="嗯，我在。")])
+        await self.start_extraction(provider=provider, authorized=False)
+        await self.plugin.on_message(self.mention("叫我小林就好", message_id="m-1"))
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(self.memory_facts(), ())
+
+    async def test_paused_group_does_not_even_chat(self):
+        provider = fakes.FakeProvider()
+        await self.start_extraction(provider=provider, paused=True)
+        await self.plugin.on_message(self.mention("叫我小林就好", message_id="m-1"))
+        self.assertEqual(provider.calls, [])
+        self.assertEqual(self.sent, [])
+
+    async def test_extraction_failure_leaves_the_reply_alone(self):
+        provider = fakes.FakeProvider(
+            script=[
+                fakes.FakeLLMResponse(text="嗯，我在。"),
+                fakes.FakeApiError(500, "provider down"),
+                fakes.FakeApiError(500, "provider down"),
+            ]
+        )
+        await self.start_extraction(provider=provider)
+        event = self.mention("叫我小林就好", message_id="m-1")
+        await self.plugin.on_message(event)
+
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(text_of(self.sent[0]), "嗯，我在。")
+        self.assertEqual(self.memory_facts(), ())
+        # 抽取自身重试一次后放弃，聊天不受任何影响。
+        self.assertEqual(len(provider.calls), 3)
+        snapshot = self.plugin.services.health.snapshot()
+        self.assertEqual((snapshot.extraction_successes, snapshot.extraction_failures), (0, 1))
+
+    async def test_unusable_model_output_writes_nothing(self):
+        provider = fakes.FakeProvider(
+            script=[
+                fakes.FakeLLMResponse(text="嗯，我在。"),
+                fakes.FakeLLMResponse(text="我觉得他喜欢看番"),
+            ]
+        )
+        await self.start_extraction(provider=provider)
+        await self.plugin.on_message(self.mention("我喜欢看番", message_id="m-1"))
+        self.assertEqual(self.memory_facts(), ())
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.plugin.services.health.snapshot().extraction_failures, 1)
+
+    async def test_the_same_message_is_never_extracted_twice(self):
+        provider = fakes.FakeProvider(
+            script=[
+                fakes.FakeLLMResponse(text="嗯，我在。"),
+                fakes.FakeLLMResponse(text='[{"category": "interest", "content": "看番"}]'),
+            ]
+        )
+        await self.start_extraction(provider=provider)
+        await self.plugin.on_message(self.mention("我喜欢看番", message_id="m-1"))
+        await self.plugin.on_message(self.mention("我喜欢看番", message_id="m-1"))
+        self.assertEqual(len(provider.calls), 2)
+        self.assertEqual(len(self.memory_facts()), 1)
+
+    async def test_an_empty_candidate_list_is_still_a_success(self):
+        provider = fakes.FakeProvider(
+            script=[
+                fakes.FakeLLMResponse(text="嗯，我在。"),
+                fakes.FakeLLMResponse(text="[]"),
+            ]
+        )
+        await self.start_extraction(provider=provider)
+        await self.plugin.on_message(self.mention("你好", message_id="m-1"))
+        snapshot = self.plugin.services.health.snapshot()
+        self.assertEqual((snapshot.extraction_successes, snapshot.extraction_failures), (1, 0))
+        self.assertEqual(self.memory_facts(), ())
 
 
 if __name__ == "__main__":
