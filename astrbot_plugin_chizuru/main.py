@@ -14,11 +14,14 @@
 
 | 结果 | dedup | budget |
 |---|---|---|
-| 装配拒绝（固定规则 + 当前输入超预算） | `release` | 未预留 |
-| 队列满 / 等待超时 / 调度器已关闭（从未开始） | `release` | `cancel` |
-| 预算拒绝、提供商不可用、message_id 不可用 | `release` | 未预留 |
-| 超业务期限（已开始，无结果） | `finish(COMPLETED)` | `settle(None)` 按估算 |
-| 正常返回（含空回复与失败分支） | `finish(COMPLETED)` | `settle(usage)` |
+| 装配拒绝（固定规则 + 当前输入超预算）：回一次缩短提示 | `finish` | 未预留 |
+| 队列满 / 等待调度超时（从未开始）：回一次忙碌提示 | `finish` | `cancel` |
+| 调度器已关闭（从未开始） | `release` | `cancel` |
+| 预算拒绝、提供商不可用：回一次暂不可用提示 | `finish` | 未预留 |
+| message_id 不可用 | 不进入去重 | 未预留 |
+| 超业务期限（已开始，无结果）：回一次失败提示 | `finish` | `settle(None)` 按估算 |
+| 正常返回（含已分类的失败与空回复：回一次固定提示） | `finish` | `settle(usage)` |
+| 正常返回但类别无文案（未分类故障） | `finish(COMPLETED)` | `settle(usage)` |
 | `event.send` 抛异常（发送不确定） | `finish(SEND_UNCERTAIN)` | 已结算 |
 
 被框架取消（`CancelledError`）时条目留在 `IN_FLIGHT`，由 TTL 收敛：不确定是否已发送，
@@ -35,7 +38,7 @@
 - 动态材料、互动历史与**长期记忆**（S2-06/S2-07/S3-08）已接入请求：材料与记忆只落
   `extra_user_content_parts` 并标记为临时，历史只落 `contexts`；三者都经同一 token 预算
   裁剪，**结构上不进 system**。预算不够时先丢群聊材料、再丢记忆行、最后丢历史。超预算时
-  不调模型、不发送、静默（超长提示文案属附录 C 待审范围）。
+  不调模型、不发送正文，只回一次缩短提示（S4-01，文案取自附录 C.5）。
 - 记忆注入以**本轮的修订号快照先于读取**为前置（S3-09）：用了记忆的那一轮不写回共享历史
   （`memory_assisted`），因此注入的记忆不会永久混进群历史。
 - 互动历史写回只在**送达成功**后进行，且写前重读群/成员修订号；写失败只记审计，
@@ -50,11 +53,16 @@
   `记忆 关闭` 与 `记忆 删除全部` 等价（先撤权、再清空）。全部经 `FIXED_NOTICE` 出站，
   因此**暂停群里的删除与关闭仍然可达**（需求 §4.4）。`帮助` 仍不执行（回执文案待审）。
 - 群内出口：`千鹤 状态`、`群上下文 开启`（含确认失败时的重发全文）、记忆类回执与列表、
-  以及 `@` 后的聊天回复。`上下文 退出/加入` 与 S2-05 的其余状态变更执行但**静默无回执**。
+  `@` 后的聊天回复，以及**固定提示**（附件能力、失败、空回复、忙碌、暂不可用、超预算，
+  S4-01；文案逐字取自 `fixed_notice.py`，见附录 C.5）。`上下文 退出/加入` 与 S2-05 的
+  其余状态变更执行但**静默无回执**。
 - 存储路径来自 AstrBot 插件数据目录，**延迟建库**（不写不建文件）；解析或打开失败即
   降级为"无存储"，采集与退出/加入保持关闭，`千鹤 状态` 可见。
 - 去重窗口与容量是装配层常量，标注"建议参数待评审"——取值依赖仍未在线核验的 O-07。
-- 聊天失败不发任何群内提示：同样的理由（架构 §8.3 的失败文案属 S4-01）。
+- 固定提示（S4-01）：失败、空回复、排队、超预算与附件能力都只对**已有的有效 @** 回一次
+  简短文案，固定提示不调模型、不写互动历史、不触发抽取；`llm.follow_up` 判定"该不该说话"，
+  `fixed_notice.text_for` 给出文案，未分类的故障保持静默（宁可沉默，也不猜原因）。附件
+  分支只回能力提示，不解析附件（需求 §4.1）。
 - 记忆抽取（S3-07/S3-10）接在**回复流程之后**、同一次事件处理内 `await`（不建游离任务，
   以保住装配测试的"无新增任务"不变量）：准入看授权位（**含说明版本比对**，S3-03）、暂停、
   总开关与预算门槛；写回在单个短事务内重核修订号与授权、按"源消息 + 动作"去重。**这条
@@ -94,15 +102,34 @@ from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.agent.message import TextPart
 from astrbot.core.platform.message_type import MessageType
 
-from . import commands, context_assembly, health, history, llm, memory, notice, redact, storage
-from .budget import BudgetLedger, BudgetRefusal, BudgetRefused, PriceTable, Reservation, UsageKind
-from .config import Settings
+from . import (
+    commands,
+    context_assembly,
+    fixed_notice,
+    health,
+    history,
+    llm,
+    memory,
+    notice,
+    redact,
+    storage,
+)
+from .budget import (
+    BudgetLedger,
+    BudgetRefusal,
+    BudgetRefused,
+    PriceTable,
+    Reservation,
+    TokenPrice,
+    UsageKind,
+)
+from .config import ModelPrice, Settings
 from .context_buffer import BufferShape, ContextBuffer, IngestOutcome
 from .control import authorize
 from .dedup import ActionKind, Claim, DedupKey, DedupStore, Outcome
 from .keys import BotInstanceKey, GroupKey, MemberKey, RevisionSnapshot
 from .policy import Classification, MessageFacts, classify, is_trusted_scope
-from .scheduler import AdmissionRefused, Deadline, DeadlineExceeded, Scheduler
+from .scheduler import AdmissionRefused, Deadline, DeadlineExceeded, Refusal, Scheduler
 from .send_gate import (
     DropReason,
     GateFacts,
@@ -242,8 +269,8 @@ class ChizuruPlugin(Star):
         self.history_store: object | None = None
         """互动历史存储（S2-07）的测试注入点；默认用 `_ConversationHistory(context)`。"""
         self.price_table: PriceTable | None = None
-        """价目表的测试注入点。生产恒为空价目表——**金额未配置前不接价目表**（R20：
-        空价目表 + 已配金额会让 `reserve` 保守拒绝，价目表来源的落地钉在 S4-01）。"""
+        """价目表的测试注入点；生产由配置键 `model_prices` 构造（S4-01，R20）。
+        注入时优先于配置——离线用例据此构造"已配置金额 + 已知价格"的组合。"""
 
     # ---- 生命周期 ----
 
@@ -261,7 +288,7 @@ class ChizuruPlugin(Star):
             ),
             budget=BudgetLedger(
                 settings.budget,
-                prices=PriceTable() if self.price_table is None else self.price_table,
+                prices=self._price_table(settings),
                 clock=self.datetime_clock,
             ),
             scheduler=Scheduler(settings.limits, monotonic=self.clock),
@@ -411,8 +438,11 @@ class ChizuruPlugin(Star):
         if services is None:
             return
         if classification is not Classification.TEXT_CANDIDATE:
-            # 非文本候选只可能进普通群聊缓冲；未告知群、私聊、@全体、附件与命令
-            # 一律在 `_maybe_collect` 内被拒绝（需求 §4.1/§4.2），零出站零模型调用。
+            if classification is Classification.UNSUPPORTED_ATTACHMENT:
+                # "@ 后只有附件"是唯一允许回固定提示的非文本档（需求 §4.1，S4-01）；
+                # 其余非文本档（未告知群、私聊、@全体、空 @、命令）零出站零模型调用。
+                await self._handle_attachment(event, facts, settings, services)
+                return
             outcome = self._maybe_collect(event, facts, settings, services)
             if outcome is not IngestOutcome.STORED:
                 self._audit(services, redact.EventCategory.IGNORED)
@@ -554,6 +584,33 @@ class ChizuruPlugin(Star):
 
     # ---- 聊天 ----
 
+    async def _handle_attachment(
+        self,
+        event: AstrMessageEvent,
+        facts: MessageFacts,
+        settings: Settings,
+        services: _Services,
+    ) -> None:
+        """@ 后只有附件：回一次固定的文本能力提示（需求 §4.1，S4-01）。
+
+        不解析附件、不进缓冲、不读存储、不请求模型；去重口径与聊天一致
+        （拿不到稳定 `message_id` 即不处理），提示不写互动历史、不触发抽取。
+        经 `FIXED_NOTICE` 出站，因此暂停群里仍然可达。
+        """
+        group = self._group_key(facts)
+        message_id = self._message_id(event)
+        if message_id is None:
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+        key = DedupKey(group=group, message_id=message_id, action=ActionKind.CHAT_REPLY)
+        if services.dedup.begin(key) is not Claim.FIRST:
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+        outcome = await self._deliver_fixed(
+            event, facts, settings, services, group, fixed_notice.ATTACHMENT_NOTICE_TEXT
+        )
+        services.dedup.finish(key, outcome)
+
     async def _handle_chat(
         self,
         event: AstrMessageEvent,
@@ -580,18 +637,30 @@ class ChizuruPlugin(Star):
 
         prepared = await self._prepare_chat(event, facts, settings, services, message_id)
         if prepared is None:
-            # 固定规则 + 当前输入已超预算：不预留、不调用、不发送（提示文案属附录 C 待审范围）。
-            services.dedup.release(key)
-            self._audit(services, redact.EventCategory.MODEL_CALL, code=redact.ErrorCode.REQUEST_INVALID)
+            # 固定规则 + 当前输入已超预算：不预留、不调用、不发正文，只回一次缩短提示。
+            self._audit(
+                services, redact.EventCategory.MODEL_CALL, code=redact.ErrorCode.REQUEST_INVALID
+            )
+            outcome = await self._deliver_fixed(
+                event, facts, settings, services, group, fixed_notice.OVER_BUDGET_NOTICE_TEXT
+            )
+            services.dedup.finish(key, outcome)
             return
 
         provider = await self._acquire_provider(event, services, facts, message_id)
         if provider is None:
-            services.dedup.release(key)
+            outcome = await self._deliver_fixed(
+                event, facts, settings, services, group, fixed_notice.UNAVAILABLE_NOTICE_TEXT
+            )
+            services.dedup.finish(key, outcome)
             return
         reservation = self._reserve(services, provider)
-        if reservation is None:
-            services.dedup.release(key)
+        if isinstance(reservation, BudgetRefusal):
+            # 预算耗尽或价格未知（R20）：同样只回一次暂不可用提示，不发起调用。
+            outcome = await self._deliver_fixed(
+                event, facts, settings, services, group, fixed_notice.UNAVAILABLE_NOTICE_TEXT
+            )
+            services.dedup.finish(key, outcome)
             return
 
         try:
@@ -599,21 +668,31 @@ class ChizuruPlugin(Star):
                 group,
                 lambda deadline: self._ask(provider, prepared.plan, settings, services, deadline),
             )
-        except AdmissionRefused:
-            # 从未开始：额度可退，事件可重来（重连回放不该被永久判为已处理）。
+        except AdmissionRefused as refused:
+            # 从未开始：额度可退。排队满或等待超时对有效 @ 回一次忙碌提示；
+            # 调度器已关闭（插件正在停止）不尝试出站，条目释放以便重来。
             services.budget.cancel(reservation)
-            services.dedup.release(key)
             self._audit(services, redact.EventCategory.QUEUE_DEPTH, code=redact.ErrorCode.QUEUE_FULL)
+            if refused.reason in (Refusal.QUEUE_FULL, Refusal.WAIT_TIMEOUT):
+                outcome = await self._deliver_fixed(
+                    event, facts, settings, services, group, fixed_notice.BUSY_NOTICE_TEXT
+                )
+                services.dedup.finish(key, outcome)
+            else:
+                services.dedup.release(key)
             return
         except DeadlineExceeded:
-            # 已开始但无结果：缺失 usage 按预留估算入账，绝不记零。
+            # 已开始但无结果：缺失 usage 按预留估算入账，绝不记零；回一次失败提示。
             services.budget.settle(reservation, None)
-            services.dedup.finish(key, Outcome.COMPLETED)
             self._audit(
                 services,
                 redact.EventCategory.MODEL_CALL,
                 code=redact.ErrorCode.PROVIDER_UNAVAILABLE,
             )
+            outcome = await self._deliver_fixed(
+                event, facts, settings, services, group, fixed_notice.FAILURE_NOTICE_TEXT
+            )
+            services.dedup.finish(key, outcome)
             return
         except asyncio.CancelledError:
             services.budget.settle(reservation, None)
@@ -623,8 +702,20 @@ class ChizuruPlugin(Star):
         if answer.usage is not None:
             self._audit(services, redact.EventCategory.TOKEN_USAGE, tokens=answer.usage)
         if answer.kind is not llm.AnswerKind.TEXT:
-            # S1 不发失败或空回复提示：文案属 S4-01 与附录 C 待审范围。
-            services.dedup.finish(key, Outcome.COMPLETED)
+            # S4-01：`llm.follow_up` 判定该不该说话，文案由 `fixed_notice` 给出；
+            # 未分类的故障没有文案，保持静默（既不猜原因，也不把它说成可重试）。
+            notice_text = (
+                fixed_notice.text_for(answer.code)
+                if llm.follow_up(answer) is llm.FollowUp.FIXED_NOTICE
+                else None
+            )
+            if notice_text is None:
+                services.dedup.finish(key, Outcome.COMPLETED)
+                return
+            outcome = await self._deliver_fixed(
+                event, facts, settings, services, group, notice_text
+            )
+            services.dedup.finish(key, outcome)
             return
 
         outcome, sent = await self._deliver(
@@ -879,7 +970,8 @@ class ChizuruPlugin(Star):
         services.health.clear_degraded(health.Degradation.PROVIDER_DISABLED)
         return provider
 
-    def _reserve(self, services: _Services, provider: object) -> Reservation | None:
+    def _reserve(self, services: _Services, provider: object) -> Reservation | BudgetRefusal:
+        """预留额度；被拒绝时返回原因（调用方据此回一次暂不可用提示，R20）。"""
         try:
             return services.budget.reserve(UsageKind.CHAT, self._model_name(provider))
         except BudgetRefused as refused:
@@ -888,7 +980,22 @@ class ChizuruPlugin(Star):
                 redact.EventCategory.GATE_DROP,
                 code=_budget_code(refused.reason),
             )
-            return None
+            return refused.reason
+
+    def _price_table(self, settings: Settings) -> PriceTable:
+        """价目表来源（S4-01，R20）：测试注入点优先，否则取配置的 `model_prices`。
+
+        空映射＝价格未知：已配金额时 `reserve` 保守拒绝（群内回一次暂不可用提示，
+        `千鹤 状态` 的预算行同时给出原因）。模型 ID 与提供商返回值逐字比对——
+        不做大小写或别名归一，宁可拒绝也不猜用户想写哪个模型。
+        """
+        if self.price_table is not None:
+            return self.price_table
+        prices: dict[str, TokenPrice] = {
+            model: TokenPrice(price.input_per_million, price.output_per_million)
+            for model, price in settings.budget.model_prices.items()
+        }
+        return PriceTable(prices)
 
     @staticmethod
     def _model_name(provider: object) -> str:
@@ -1815,6 +1922,32 @@ class ChizuruPlugin(Star):
             kind=SendKind.FIXED_NOTICE,
             llm_invoked=False,
         )
+
+    async def _deliver_fixed(
+        self,
+        event: AstrMessageEvent,
+        facts: MessageFacts,
+        settings: Settings,
+        services: _Services,
+        group: GroupKey,
+        text: str,
+    ) -> Outcome:
+        """固定提示的统一出口（S4-01）：不调模型、不带修订号、不写历史。
+
+        文案本身不含任何用户数据，因此不需要发送前重读修订号；`FIXED_NOTICE`
+        不受暂停约束（`_group_state`），与记忆类回执同例。
+        """
+        outcome, _ = await self._deliver(
+            event,
+            facts,
+            settings,
+            services,
+            group,
+            text,
+            kind=SendKind.FIXED_NOTICE,
+            llm_invoked=False,
+        )
+        return outcome
 
     async def _reply_memory(
         self,

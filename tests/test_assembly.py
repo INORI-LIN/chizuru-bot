@@ -35,11 +35,12 @@ test_root = None
 guard = None
 factory = None
 plugin_module = None
+fixed_notice = None
 _config_seq = 0
 
 
 def setUpModule():
-    global test_root, guard, factory, plugin_module
+    global test_root, guard, factory, plugin_module, fixed_notice
     resources = ExitStack()
     unittest.addModuleCleanup(resources.close)
     test_root = Path(
@@ -65,6 +66,7 @@ def setUpModule():
     )
     core.astrbot_config["trace_enable"] = False
     plugin_module = importlib.import_module(MODULE_NAME)
+    fixed_notice = importlib.import_module("astrbot_plugin_chizuru.fixed_notice")
     factory = fakes.EventFactory()
     unittest.addModuleCleanup(_unregister_plugin)
     unittest.addModuleCleanup(_finish_guard)
@@ -119,6 +121,23 @@ class BlockingProvider(fakes.FakeProvider):
     async def text_chat(self, **kwargs):
         self.started.set()
         await self.release.wait()
+        return await super().text_chat(**kwargs)
+
+
+class DeadlineAdvancingProvider(fakes.FakeProvider):
+    """第一次调用就把假时钟推过 45 秒业务期限，用于证明重试不重置期限。"""
+
+    def __init__(self, clock):
+        super().__init__(
+            script=[
+                fakes.FakeApiError(503, "bad gateway"),
+                fakes.FakeLLMResponse(text="第二次"),
+            ]
+        )
+        self._clock = clock
+
+    async def text_chat(self, **kwargs):
+        self._clock.advance(46.0)
         return await super().text_chat(**kwargs)
 
 
@@ -216,7 +235,7 @@ class AssemblyTestCase(unittest.IsolatedAsyncioTestCase):
         return make_config(**values)
 
     def price_table(self, model: str = "fake-model"):
-        """已知价格的价目表；生产恒为空价目表（R20 的线上落地属 S4-01）。"""
+        """已知价格的价目表；生产的价目表来自配置键 `model_prices`（S4-01，R20）。"""
         budget = sys.modules["astrbot_plugin_chizuru.budget"]
         return plugin_module.PriceTable({model: budget.TokenPrice(Decimal("1"), Decimal("1"))})
 
@@ -275,7 +294,6 @@ class ZeroOutboundTests(AssemblyTestCase):
             ("@全体", [factory.AtAll(), factory.At(qq="10001"), factory.Plain("你好")], {}),
             ("引用内历史 @", [factory.Reply(id="old", chain=[factory.At(qq="10001"), factory.Plain("旧")]), factory.Plain("在吗")], {}),
             ("空 @", [factory.At(qq="10001")], {}),
-            ("@ 后仅附件", [factory.At(qq="10001"), factory.Image(file="unused.png")], {}),
             ("错平台实例", [factory.At(qq="10001"), factory.Plain("你好")], {"platform_id": "other"}),
         ]
         for name, chain, overrides in cases:
@@ -287,8 +305,42 @@ class ZeroOutboundTests(AssemblyTestCase):
                 self.assertEqual(provider.calls, [])
                 self.assertIn(
                     event.get_extra("chizuru.classification"),
-                    {"ignore", "empty_or_unsupported", "unsupported_attachment"},
+                    {"ignore", "empty_or_unsupported"},
                 )
+
+    async def test_attachment_only_mention_gets_one_capability_notice(self):
+        """需求 §4.1 的唯一例外：@ 后只有附件时回一次固定能力提示，仍不解析、不调模型。"""
+        provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="不该发生")])
+        await self.start(provider=provider)
+        event = self.event([factory.At(qq="10001"), factory.Image(file="unused.png")])
+        await self.plugin.on_message(event)
+        self.assertEqual([text_of(m) for m in self.sent], [fixed_notice.ATTACHMENT_NOTICE_TEXT])
+        self.assertEqual(event.get_extra("chizuru.classification"), "unsupported_attachment")
+        self.assertEqual(provider.calls, [])
+        self.assertEqual(self.plugin.services.dedup.stats().in_flight, 0)
+        # 提示不进缓冲（附件不参与采集），也不写互动历史。
+        self.assertEqual(self.collected(), ())
+
+    async def test_attachment_notice_needs_message_id_and_is_not_repeated(self):
+        await self.start(provider=None)
+        missing = self.event(
+            [factory.At(qq="10001"), factory.Image(file="unused.png")], message_id=" "
+        )
+        await self.plugin.on_message(missing)
+        self.assertEqual(self.sent, [])
+
+        first = self.event(
+            [factory.At(qq="10001"), factory.Record(file="unused.amr")], message_id="attach-1"
+        )
+        delivered = self.sent
+        await self.plugin.on_message(first)
+        replay = self.event(
+            [factory.At(qq="10001"), factory.Record(file="unused.amr")], message_id="attach-1"
+        )
+        replayed = self.sent
+        await self.plugin.on_message(replay)
+        self.assertEqual([text_of(m) for m in delivered], [fixed_notice.ATTACHMENT_NOTICE_TEXT])
+        self.assertEqual(replayed, [])
 
     async def test_other_platform_is_left_alone(self):
         await self.start(provider=fakes.FakeProvider())
@@ -339,21 +391,27 @@ class ChatFlowTests(AssemblyTestCase):
         self.assertTrue(event.is_stopped())
         self.assertIsNone(event.get_result())
 
-    async def test_provider_unavailable_releases_the_event(self):
+    async def test_provider_unavailable_gives_one_notice_and_new_events_work(self):
         await self.start(provider=None)
-        first = self.mention("你好")
+        first = self.mention("你好", message_id="chat-1")
+        delivered = self.sent
         await self.plugin.on_message(first)
-        self.assertEqual(self.sent, [])
+        self.assertEqual([text_of(m) for m in delivered], [fixed_notice.UNAVAILABLE_NOTICE_TEXT])
         self.assertIn(
             plugin_module.health.Degradation.PROVIDER_DISABLED,
             self.plugin.services.health.degradations(),
         )
 
-        # 释放后可重来：同一 message_id 不会因"曾经失败"被永久判为已处理。
+        # 已用固定提示答复过的事件不重放；**新**事件照常处理（成员再发一条即重试）。
+        replay = self.mention("你好", message_id="chat-1")
+        replayed = self.sent
+        await self.plugin.on_message(replay)
+        self.assertEqual(replayed, [])
         self.context._provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="回复")])
-        second = self.mention("你好")
+        second = self.mention("你好", message_id="chat-2")
+        resumed = self.sent
         await self.plugin.on_message(second)
-        self.assertEqual(len(self.sent), 1)
+        self.assertEqual([text_of(m) for m in resumed], ["回复"])
         self.assertNotIn(
             plugin_module.health.Degradation.PROVIDER_DISABLED,
             self.plugin.services.health.degradations(),
@@ -363,7 +421,7 @@ class ChatFlowTests(AssemblyTestCase):
         await self.start(provider_error=AttributeError("Mock(spec=[]) 没有这个方法"))
         event = self.mention()
         await self.plugin.on_message(event)
-        self.assertEqual(self.sent, [])
+        self.assertEqual([text_of(m) for m in self.sent], [fixed_notice.UNAVAILABLE_NOTICE_TEXT])
 
     async def test_transient_error_retries_once(self):
         provider = fakes.FakeProvider(
@@ -377,14 +435,14 @@ class ChatFlowTests(AssemblyTestCase):
         self.assertEqual(len(provider.calls), 2)
         self.assertEqual(len(self.sent), 1)
 
-    async def test_transient_error_twice_gives_up_quietly(self):
+    async def test_transient_error_twice_ends_with_one_failure_notice(self):
         provider = fakes.FakeProvider(
             script=[fakes.FakeApiError(429, "rate limit"), fakes.FakeApiError(503, "bad gateway")]
         )
         await self.start(provider=provider)
         await self.plugin.on_message(self.mention())
         self.assertEqual(len(provider.calls), 2)
-        self.assertEqual(self.sent, [])
+        self.assertEqual([text_of(m) for m in self.sent], [fixed_notice.FAILURE_NOTICE_TEXT])
 
     async def test_auth_failure_is_not_retried_and_never_logged_verbatim(self):
         secret = "sk-should-never-appear-9f2"
@@ -394,7 +452,9 @@ class ChatFlowTests(AssemblyTestCase):
         self.plugin.logger = logger
         await self.plugin.on_message(self.mention())
         self.assertEqual(len(provider.calls), 1)
-        self.assertEqual(self.sent, [])
+        # 固定提示只对有效 @ 说一句通用失败，密钥既不进群消息也不进日志。
+        self.assertEqual([text_of(m) for m in self.sent], [fixed_notice.FAILURE_NOTICE_TEXT])
+        self.assertNotIn(secret, " ".join(text_of(m) for m in self.sent))
         rendered = " ".join(
             str(call) for call in logger.info.call_args_list + logger.debug.call_args_list
         )
@@ -410,11 +470,11 @@ class ChatFlowTests(AssemblyTestCase):
         self.assertEqual(len(provider.calls), 1)
         self.assertEqual(self.sent, [])
 
-    async def test_empty_reply_produces_no_output(self):
+    async def test_empty_reply_gets_one_notice(self):
         provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="   ")])
         await self.start(provider=provider)
         await self.plugin.on_message(self.mention())
-        self.assertEqual(self.sent, [])
+        self.assertEqual([text_of(m) for m in self.sent], [fixed_notice.EMPTY_REPLY_NOTICE_TEXT])
 
     async def test_duplicate_message_id_is_not_reprocessed(self):
         provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="一次")])
@@ -436,7 +496,25 @@ class ChatFlowTests(AssemblyTestCase):
         self.assertEqual(stats.uncertain, 1)
         self.assertEqual(stats.in_flight, 0)
 
-    async def test_queue_full_releases_budget_and_dedup(self):
+    async def test_uncertain_send_is_observable_and_not_replayed(self):
+        """S4-02：固定提示的发送结果不确定时同样可观察，且不重放、不写历史。"""
+        provider = fakes.FakeProvider(script=[fakes.FakeApiError(401, "invalid api key")])
+        await self.start(provider=provider)
+        event = self.mention("你好", message_id="chat-1")
+        delivered = fakes.attach_send_sink(event, error=RuntimeError("协议端断开"))
+        await self.plugin.on_message(event)
+        stats = self.plugin.services.dedup.stats()
+        self.assertEqual(stats.uncertain, 1)
+        self.assertEqual(stats.in_flight, 0)
+
+        # 不确定 = 不盲目重发：同一 message_id 重放不再出站。
+        replay = self.mention("你好", message_id="chat-1")
+        replayed = self.sent
+        await self.plugin.on_message(replay)
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(replayed, [])
+
+    async def test_queue_full_gives_one_busy_notice_and_keeps_bounds(self):
         provider = BlockingProvider()
         await self.start(provider=provider, config=make_config(chat_queue_per_group=1))
         running = asyncio.create_task(self.plugin.on_message(self.mention("第一条", message_id="event-1")))
@@ -453,8 +531,12 @@ class ChatFlowTests(AssemblyTestCase):
             third = self.mention("第三条", message_id="event-3")
             third_sent = self.sent
             await self.plugin.on_message(third)
-            self.assertEqual(third_sent, [])
-            # 被拒绝的那次不留预留：在途额度仍只有前两条。
+            # 排队已满：对有效 @ 回一次忙碌提示，且不留预留（在途额度仍只有前两条）。
+            self.assertEqual([text_of(m) for m in third_sent], [fixed_notice.BUSY_NOTICE_TEXT])
+            self.assertEqual(self.plugin.services.budget.snapshot().outstanding, 2)
+            # 同一条消息重放不再重复提示。
+            await self.plugin.on_message(self.mention("第三条", message_id="event-3"))
+            self.assertEqual(len(third_sent), 1)
             self.assertEqual(self.plugin.services.budget.snapshot().outstanding, 2)
         finally:
             provider.release.set()
@@ -474,26 +556,47 @@ class ChatFlowTests(AssemblyTestCase):
             await asyncio.sleep(0)
         return False
 
-    async def test_deadline_exceeded_settles_by_estimate(self):
+    async def test_deadline_exceeded_settles_by_estimate_and_gives_one_notice(self):
         provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="来不及")])
         await self.start(provider=provider)
         self.plugin.services.scheduler.submit_chat = AsyncMock(
             side_effect=plugin_module.DeadlineExceeded("超期")
         )
         await self.plugin.on_message(self.mention())
-        self.assertEqual(self.sent, [])
+        self.assertEqual([text_of(m) for m in self.sent], [fixed_notice.FAILURE_NOTICE_TEXT])
         snapshot = self.plugin.services.budget.snapshot()
         # 缺失 usage 按预留估算入账，绝不记零。
         self.assertEqual(snapshot.day_tokens.input_tokens, 8192)
         self.assertEqual(snapshot.day_tokens.output_tokens, 512)
         self.assertEqual(self.plugin.services.dedup.stats().in_flight, 0)
 
-    async def test_configured_budget_without_prices_refuses_conservatively(self):
+    async def test_retry_never_resets_the_business_deadline(self):
+        """S4-02：重试共用同一个 45 秒期限，期限耗尽即停，不发起第二次调用。"""
+        provider = DeadlineAdvancingProvider(self.clock)
+        await self.start(provider=provider)
+        await self.plugin.on_message(self.mention())
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual([text_of(m) for m in self.sent], [fixed_notice.FAILURE_NOTICE_TEXT])
+
+    async def test_configured_budget_without_prices_is_refused_with_a_visible_notice(self):
         provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="不该发生")])
         await self.start(provider=provider, config=make_config(daily_budget_amount=5))
         await self.plugin.on_message(self.mention())
         self.assertEqual(provider.calls, [])
-        self.assertEqual(self.sent, [])
+        self.assertEqual([text_of(m) for m in self.sent], [fixed_notice.UNAVAILABLE_NOTICE_TEXT])
+
+    async def test_configured_budget_with_prices_reaches_the_model(self):
+        """R20 的修复面：配上价目表后，已配金额不再让聊天静默停摆。"""
+        provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="有价格就能聊")])
+        await self.start(
+            provider=provider,
+            config=make_config(daily_budget_amount=5),
+            price_table=self.price_table("fake-model"),
+        )
+        await self.plugin.on_message(self.mention())
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual([text_of(m) for m in self.sent], ["有价格就能聊"])
+        self.assertGreater(self.plugin.services.budget.snapshot().day_amount, Decimal(0))
 
 
 class StatusCommandTests(AssemblyTestCase):
@@ -548,11 +651,40 @@ class StatusCommandTests(AssemblyTestCase):
         provider = fakes.FakeProvider(script=[fakes.FakeApiError(401, "invalid api key")])
         await self.start(provider=provider, platform=fakes.FakePlatform())
         await self.plugin.on_message(self.mention("你好", message_id="event-chat"))
-        self.assertEqual(self.sent, [])
+        # 失败只回一次固定提示；随后的控制命令照常可达。
+        self.assertEqual([text_of(m) for m in self.sent], [fixed_notice.FAILURE_NOTICE_TEXT])
 
         await self.plugin.on_message(self.mention("千鹤 状态", message_id="event-status"))
         self.assertEqual(len(self.sent), 1)
         self.assertIn("平台连接：运行中", text_of(self.sent[0]))
+
+    async def test_status_reports_price_table_state_when_amounts_are_set(self):
+        """R20 的可见性：已配金额时，状态行同时说明价目表是否已配置。"""
+        await self.start(
+            provider=fakes.FakeProvider(),
+            platform=fakes.FakePlatform(),
+            config=make_config(daily_budget_amount=5),
+        )
+        await self.plugin.on_message(self.mention("千鹤 状态", message_id="status-1"))
+        report = text_of(self.sent[0])
+        self.assertIn("价目表 未配置（已配金额，模型请求会被保守拒绝）", report)
+
+    async def test_status_omits_price_table_line_without_amounts(self):
+        await self.start(provider=fakes.FakeProvider(), platform=fakes.FakePlatform())
+        await self.plugin.on_message(self.mention("千鹤 状态", message_id="status-1"))
+        self.assertNotIn("价目表", text_of(self.sent[0]))
+
+    async def test_status_shows_configured_price_table(self):
+        await self.start(
+            provider=fakes.FakeProvider(),
+            platform=fakes.FakePlatform(),
+            config=make_config(
+                daily_budget_amount=5,
+                model_prices={"fake-model": {"input_per_million": 1.0, "output_per_million": 2.0}},
+            ),
+        )
+        await self.plugin.on_message(self.mention("千鹤 状态", message_id="status-1"))
+        self.assertIn("价目表 已配置", text_of(self.sent[0]))
 
 
 class LifecycleAndStructureTests(AssemblyTestCase):
@@ -952,7 +1084,7 @@ class ContextInjectionTests(AssemblyTestCase):
         await self.plugin.on_message(self.mention("你好", message_id="chat-1"))
         self.assertEqual(self.extra_parts(provider.calls[0]), [])
 
-    async def test_over_budget_request_is_refused_silently(self):
+    async def test_over_budget_request_is_refused_with_a_shorter_prompt(self):
         provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="嗯。")])
         config = make_config(input_token_budget=10)
         await self.start_with_storage(provider=provider, config=config)
@@ -960,7 +1092,7 @@ class ContextInjectionTests(AssemblyTestCase):
         before = self.plugin.services.budget.snapshot()
         await self.plugin.on_message(self.mention("你好", message_id="chat-1"))
         self.assertEqual(provider.calls, [])
-        self.assertEqual(self.sent, [])
+        self.assertEqual([text_of(m) for m in self.sent], [fixed_notice.OVER_BUDGET_NOTICE_TEXT])
         self.assertEqual(self.plugin.services.budget.snapshot(), before)
 
 
@@ -1320,6 +1452,20 @@ class MaintainerCommandTests(AssemblyTestCase):
         await self.plugin.on_message(self.mention("你好", message_id="chat-2"))
         self.assertEqual(len(provider.calls), 1)
         self.assertEqual(len(self.sent), 1)
+
+    async def test_paused_group_still_answers_an_attachment_only_mention(self):
+        """附件能力提示走 `FIXED_NOTICE`，与状态查询同例豁免暂停（S4-01 的记录决策）。"""
+        provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="不该发生")])
+        await self.start_with_storage(provider=provider)
+        self.open_group()
+        await self.plugin.on_message(self.mention("千鹤 暂停", message_id="pause-1"))
+        await self.plugin.on_message(
+            self.event(
+                [factory.At(qq="10001"), factory.Video(file="unused.mp4")], message_id="attach-1"
+            )
+        )
+        self.assertEqual([text_of(m) for m in self.sent], [fixed_notice.ATTACHMENT_NOTICE_TEXT])
+        self.assertEqual(provider.calls, [])
 
     async def test_pause_keeps_the_member_leave_channel_open(self):
         await self.start_with_storage()

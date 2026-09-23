@@ -147,6 +147,8 @@ class BudgetSnapshot:
     outstanding: int
     paused: bool
     extraction_allowed: bool
+    prices_configured: bool = False
+    """价目表是否已配置（S4-01）。**只在金额已配置时才参与判定**（R20）。"""
 
 
 class BudgetLedger:
@@ -279,6 +281,7 @@ class BudgetLedger:
             outstanding=len(self._outstanding),
             paused=self._limit_reached(UsageKind.CHAT),
             extraction_allowed=self.extraction_allowed,
+            prices_configured=self._prices.configured,
         )
 
     # ---- 内部 ----

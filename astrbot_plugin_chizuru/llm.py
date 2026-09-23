@@ -375,7 +375,7 @@ def map_usage(raw: object) -> TokenUsage | None:
 
 
 class FollowUp(StrEnum):
-    """这次调用的结果该在群里产生什么类别。**不含文案**（文案属 S4-01）。"""
+    """这次调用的结果该在群里产生什么类别。**不含文案**（文案在 `fixed_notice`）。"""
 
     SEND_TEXT = "send_text"
     FIXED_NOTICE = "fixed_notice"

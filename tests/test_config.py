@@ -1,5 +1,6 @@
 import unittest
 from dataclasses import replace
+from decimal import Decimal
 
 from astrbot_plugin_chizuru.config import (
     BudgetSettings,
@@ -131,6 +132,58 @@ class BudgetTests(unittest.TestCase):
     def test_requirement_can_be_waived_explicitly(self):
         budget = BudgetSettings(require_budget_for_extraction=False)
         self.assertTrue(budget.extraction_allowed(requested=True))
+
+
+class ModelPriceTests(unittest.TestCase):
+    """S4-01：价目表的运行时来源。数值由部署填入，仓库只定义形状。"""
+
+    def test_prices_are_parsed_exactly(self):
+        settings = Settings.from_mapping(
+            {
+                **VALID,
+                "model_prices": {
+                    "fake-model": {"input_per_million": 1.5, "output_per_million": 2}
+                },
+            }
+        )
+        self.assertTrue(settings.identity_configured)
+        self.assertEqual(set(settings.budget.model_prices), {"fake-model"})
+        price = settings.budget.model_prices["fake-model"]
+        self.assertEqual(price.input_per_million, Decimal("1.5"))
+        self.assertEqual(price.output_per_million, Decimal("2"))
+
+    def test_empty_mapping_means_unknown_prices(self):
+        settings = Settings.from_mapping({**VALID, "model_prices": {}})
+        self.assertEqual(dict(settings.budget.model_prices), {})
+        self.assertEqual(settings.budget.model_prices, Settings().budget.model_prices)
+
+    def test_zero_price_is_a_legal_value(self):
+        # "未配置"由空映射表达；0 元单价（自建代理等）必须能表达。
+        settings = Settings.from_mapping(
+            {
+                **VALID,
+                "model_prices": {"m": {"input_per_million": 0, "output_per_million": 0}},
+            }
+        )
+        self.assertEqual(settings.budget.model_prices["m"].input_per_million, Decimal(0))
+
+    def test_malformed_prices_reject_everything(self):
+        for value in (
+            [],
+            "x",
+            None,
+            {" ": {"input_per_million": 1, "output_per_million": 1}},
+            {"m": 1},
+            {"m": {"input_per_million": 1}},
+            {"m": {"input_per_million": 1, "output_per_million": 1, "extra": 1}},
+            {"m": {"input_per_million": True, "output_per_million": 1}},
+            {"m": {"input_per_million": -1, "output_per_million": 1}},
+            {"m": {"input_per_million": float("inf"), "output_per_million": 1}},
+            {"m": {"input_per_million": float("nan"), "output_per_million": 1}},
+            {"m": {"input_per_million": "1", "output_per_million": 1}},
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(Settings.from_mapping({**VALID, "model_prices": value}), Settings())
 
 
 class LimitsTests(unittest.TestCase):

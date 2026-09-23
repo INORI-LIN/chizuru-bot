@@ -126,7 +126,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(list(test_root.rglob("*.db")))
         core.pip_installer.install.assert_not_called()
 
-    def event(self, chain, *, platform="aiocqhttp", platform_id="qq-local", self_id="10001", group_id="20001", sender_id="30001", nickname="同名", private=False):
+    def event(self, chain, *, platform="aiocqhttp", platform_id="qq-local", self_id="10001", group_id="20001", sender_id="30001", nickname="同名", private=False, message_id="event-1"):
         message = AstrBotMessage()
         message.type = MessageType.FRIEND_MESSAGE if private else MessageType.GROUP_MESSAGE
         message.self_id = self_id
@@ -134,7 +134,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         message.sender = MessageMember(user_id=sender_id, nickname=nickname)
         message.message = chain
         message.message_str = "伪造的拼接文本不应成为直接输入"
-        message.message_id = "event-1"
+        message.message_id = message_id
         message.raw_message = {}
         event = AstrMessageEvent(message.message_str, message, PlatformMetadata(platform, "offline", platform_id), group_id)
         event.send = AsyncMock(side_effect=AssertionError("send forbidden"))
@@ -167,8 +167,8 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((PLUGIN_PATH / "requirements.txt").exists())
 
     async def test_real_components_and_no_output(self):
+        """无有效 @、空 @、@全体、引用内历史 @ 与命令一律静默（需求 §4.1）。"""
         cases = [
-            ([At(qq=10001), Plain("hello")], "text_candidate"),
             ([Plain("@千鹤 /help [CQ:at,qq=10001]")], "ignore"),
             ([At(qq="10002"), Plain("hello")], "ignore"),
             ([AtAll(), At(qq="10001"), Plain("hello")], "ignore"),
@@ -177,12 +177,6 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             ([At(qq="10001"), Reply(id="old", chain=[Plain("old")])], "empty_or_unsupported"),
             ([At(qq="10001")], "empty_or_unsupported"),
             ([At(qq="10001"), Plain(" \n")], "empty_or_unsupported"),
-            # 需求 §4.1：@ 后只有媒体时是独立一档，可回固定能力提示，仍不解析、不调模型。
-            ([At(qq="10001"), Image(file="unused.png")], "unsupported_attachment"),
-            ([At(qq="10001"), Record(file="unused.amr")], "unsupported_attachment"),
-            ([At(qq="10001"), Video(file="unused.mp4")], "unsupported_attachment"),
-            ([At(qq="10001"), File(name="unused.pdf")], "unsupported_attachment"),
-            ([At(qq="10001"), Plain("   "), Image(file="unused.png")], "unsupported_attachment"),
         ]
         for chain, expected in cases:
             with self.subTest(expected=expected, types=[type(part).__name__ for part in chain]):
@@ -197,6 +191,34 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         followup = self.event([Plain("hello")])
         await self.plugin.on_message(followup)
         self.assertEqual(followup.get_extra("chizuru.classification"), "ignore")
+
+    async def test_mention_cases_leave_the_group_output_to_the_plugin(self):
+        """真实组件下的两条出站档：附件回能力提示；纯文本因未装提供商回暂不可用提示。
+
+        两者都**只**经装配层的固定提示路径：不解析附件、不调用模型、结果交回框架为空。
+        """
+        cases = [
+            ([At(qq=10001), Plain("hello")], "text_candidate", "现在我暂时不可用，请稍后再试，或联系本群维护者。"),
+            ([At(qq="10001"), Image(file="unused.png")], "unsupported_attachment", "我目前只能读文字消息，还看不了图片、语音和文件。请把想说的内容用文字发给我。"),
+            ([At(qq="10001"), Record(file="unused.amr")], "unsupported_attachment", "我目前只能读文字消息，还看不了图片、语音和文件。请把想说的内容用文字发给我。"),
+            ([At(qq="10001"), Video(file="unused.mp4")], "unsupported_attachment", "我目前只能读文字消息，还看不了图片、语音和文件。请把想说的内容用文字发给我。"),
+            ([At(qq="10001"), File(name="unused.pdf")], "unsupported_attachment", "我目前只能读文字消息，还看不了图片、语音和文件。请把想说的内容用文字发给我。"),
+            ([At(qq="10001"), Plain("   "), Image(file="unused.png")], "unsupported_attachment", "我目前只能读文字消息，还看不了图片、语音和文件。请把想说的内容用文字发给我。"),
+        ]
+        for index, (chain, expected, text) in enumerate(cases):
+            with self.subTest(expected=expected, types=[type(part).__name__ for part in chain]):
+                event = self.event(chain, message_id=f"case-{index}")
+                self.assertEqual(self.plugin.classify_event(event), expected)
+                result = [item async for item in call_handler(event, self.plugin.on_message)]
+                self.assertTrue(event.is_stopped())
+                self.assertIsNone(event.get_result())
+                self.assertEqual(result, [None])
+                self.assertEqual(event.get_extra("chizuru.classification"), expected)
+                self.assertEqual(event.send.await_count, 1)
+                sent = event.send.await_args.args[0]
+                self.assertEqual(
+                    "".join(part.text for part in sent.chain if hasattr(part, "text")), text
+                )
 
     async def test_identity_rejections_and_other_platform(self):
         chain = [At(qq="10001"), Plain("hello")]
@@ -248,7 +270,8 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results, [None])
         self.assertTrue(event.is_stopped())
         self.assertIsNone(event.get_result())
-        event.send.assert_not_called()
+        # 未装提供商 → 固定提示一次（S4-01）；结果仍交回框架为空，不产生第二条默认链路回复。
+        self.assertEqual(event.send.await_count, 1)
 
     async def test_invalid_live_configuration_still_stops(self):
         self.plugin.config["allowed_group_ids"] = [True]

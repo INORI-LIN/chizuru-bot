@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from decimal import Decimal
 
 
 def is_qq_id(value: object) -> bool:
@@ -82,11 +83,31 @@ class MemorySettings:
 
 
 @dataclass(frozen=True)
+class ModelPrice:
+    """模型 ID 的每百万 token 单价（S4-01：价目表的运行时来源）。
+
+    价格**不写死在仓库里**：需求 §6 要求不固定未经核验的名称与价格，因此这里只有
+    形状与校验，具体数值由部署时填入。价格 0 是合法值（例如自建代理），
+    **"未配置"用空映射表示，不用 0 表示**。
+    """
+
+    input_per_million: Decimal
+    output_per_million: Decimal
+
+    def __post_init__(self) -> None:
+        for name in ("input_per_million", "output_per_million"):
+            value = getattr(self, name)
+            if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
+                raise ValueError(f"{name} 必须是非负有限 Decimal：{value!r}")
+
+
+@dataclass(frozen=True)
 class BudgetSettings:
     """用量与预算。
 
     金额为 0 表示**未配置**：此时自动记忆抽取保持关闭（需求 §6），而不是
-    "不限额度"。
+    "不限额度"。`model_prices` 为空表示价格未知：已配金额时每次请求都会被
+    `budget` 保守拒绝（R20），并在 `千鹤 状态` 的价格行里可见。
     """
 
     input_token_budget: int = 8192
@@ -94,6 +115,7 @@ class BudgetSettings:
     daily_amount: float = 0.0
     monthly_amount: float = 0.0
     require_budget_for_extraction: bool = True
+    model_prices: Mapping[str, ModelPrice] = field(default_factory=dict)
 
     @property
     def budget_configured(self) -> bool:
@@ -225,6 +247,7 @@ def default_fields() -> dict[str, object]:
         "daily_budget_amount": sentinel.budget.daily_amount,
         "monthly_budget_amount": sentinel.budget.monthly_amount,
         "require_budget_for_extraction": sentinel.budget.require_budget_for_extraction,
+        "model_prices": {},
         "provider_concurrency_global": sentinel.limits.provider_concurrency_global,
         "provider_concurrency_per_group": sentinel.limits.provider_concurrency_per_group,
         "chat_queue_per_group": sentinel.limits.chat_queue_per_group,
@@ -257,6 +280,43 @@ def _require_amount(config: Mapping[str, object], key: str) -> float:
     if not _is_non_negative_number(value):
         raise ValueError(f"{key} 不合格：{value!r}")
     return float(value)
+
+
+def _require_price(value: object, name: str) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} 必须是数字：{value!r}")
+    amount = Decimal(str(value))
+    if not amount.is_finite() or amount < 0:
+        raise ValueError(f"{name} 必须是非负有限值：{value!r}")
+    return amount
+
+
+def _parse_prices(raw: object) -> Mapping[str, ModelPrice]:
+    """模型 ID → 单价。空映射＝未配置；形状不符即整份配置退回哨兵（fail-closed）。
+
+    模型 ID 与提供商 `get_model()` 的返回值**逐字比对**（不做大小写或别名归一），
+    因此这里只检查"非空且无首尾空白"，不猜测用户想写哪个模型。
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("model_prices 必须是模型 ID 到单价的映射")
+    prices: dict[str, ModelPrice] = {}
+    expected = {"input_per_million", "output_per_million"}
+    for model, price in raw.items():
+        if not _is_plain_str(model):
+            raise ValueError(f"model_prices 的模型 ID 不合格：{model!r}")
+        if not isinstance(price, dict) or set(price) != expected:
+            raise ValueError(
+                f"model_prices[{model}] 必须恰含 input_per_million 与 output_per_million"
+            )
+        prices[model] = ModelPrice(
+            input_per_million=_require_price(
+                price["input_per_million"], f"model_prices[{model}].input_per_million"
+            ),
+            output_per_million=_require_price(
+                price["output_per_million"], f"model_prices[{model}].output_per_million"
+            ),
+        )
+    return prices
 
 
 def _parse_maintainers(raw: object) -> MaintainerMap:
@@ -297,6 +357,7 @@ def _parse_budget(config: Mapping[str, object]) -> BudgetSettings:
         daily_amount=_require_amount(config, "daily_budget_amount"),
         monthly_amount=_require_amount(config, "monthly_budget_amount"),
         require_budget_for_extraction=_require_flag(config, "require_budget_for_extraction"),
+        model_prices=_parse_prices(config["model_prices"]),
     )
 
 

@@ -102,6 +102,12 @@
     "hint": "设计基线：保持 true。改为 false 相当于在无额度控制下开放付费调用。",
     "default": true
   },
+  "model_prices": {
+    "type": "dict",
+    "description": "模型 ID 到每百万 token 单价的映射",
+    "hint": "形如 {\"deepseek-chat\": {\"input_per_million\": 1.0, \"output_per_million\": 2.0}}。模型 ID 必须与提供商返回值逐字一致（不区分大小写不生效）。留空表示价格未知：一旦配置金额，所有模型请求都会被保守拒绝。",
+    "default": {}
+  },
   "provider_concurrency_global": {
     "type": "int",
     "description": "全局模型并发上限",

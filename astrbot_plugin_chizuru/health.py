@@ -316,12 +316,18 @@ def format_report(snapshot: HealthSnapshot, *, configured: bool) -> tuple[str, .
 
     if snapshot.budget is not None:
         budget = snapshot.budget
-        lines.append(
-            "预算："
-            + ("已配置" if budget.configured else "未配置（自动抽取保持关闭）")
-            + f"；暂停 {'是' if budget.paused else '否'}"
+        line = "预算：" + ("已配置" if budget.configured else "未配置（自动抽取保持关闭）")
+        if budget.configured:
+            # 只在金额已配置时输出（**新文案待评审**）：此时价目表才参与判定，
+            # 未配置会让每次请求被保守拒绝（R20），维护者据此定位"静默停摆"。
+            line += "；价目表 " + (
+                "已配置" if budget.prices_configured else "未配置（已配金额，模型请求会被保守拒绝）"
+            )
+        line += (
+            f"；暂停 {'是' if budget.paused else '否'}"
             + f"；抽取 {'允许' if budget.extraction_allowed else '关闭'}"
         )
+        lines.append(line)
 
     if snapshot.scheduler is not None:
         stats = snapshot.scheduler

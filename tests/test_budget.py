@@ -251,6 +251,11 @@ class StructuralTests(unittest.TestCase):
         self.assertIsNone(table.cost(MODEL, TokenUsage(1000, 100)))
         self.assertFalse(table.configured)
 
+    def test_snapshot_reports_whether_prices_are_configured(self):
+        """S4-01：`千鹤 状态` 据此说明"已配金额但价格未知"（R20 的可见性）。"""
+        self.assertFalse(ledger(prices=PriceTable()).snapshot().prices_configured)
+        self.assertTrue(ledger(daily_amount=1.0).snapshot().prices_configured)
+
     def test_module_does_not_import_the_framework(self):
         text = (PLUGIN_ROOT / "budget.py").read_text()
         self.assertNotIn("import astrbot", text)

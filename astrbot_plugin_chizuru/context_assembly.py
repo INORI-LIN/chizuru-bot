@@ -305,8 +305,9 @@ def trim_to_budget(
     即预算不够时先丢群聊材料、再丢记忆行、最后丢历史。记忆行按**记录号从新到旧**保留
     （无相关性信号时以新近度代替，与需求 §4.3"以本人后续明确表达为准"同向）。
 
-    只有"固定规则 + 当前输入"本身就超预算时才拒绝——拒绝时不调模型、不发送、不发明提示
-    文案（超长提示文案属附录 C 待审范围）。
+    只有"固定规则 + 当前输入"本身就超预算时才拒绝——拒绝时不调模型、不发送请求、不发明
+    提示文案（群内的缩短提示在装配层 `main` 由 `fixed_notice.OVER_BUDGET_NOTICE_TEXT` 给出，
+    本模块仍然只回答"能不能装下"）。
     """
     if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
         raise ValueError("budget 必须是正整数")

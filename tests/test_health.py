@@ -33,7 +33,7 @@ def health(instance_present: bool = True, state: PlatformState = PlatformState.R
     )
 
 
-def budget(configured: bool = False, paused: bool = False) -> BudgetSnapshot:
+def budget(configured: bool = False, paused: bool = False, prices_configured: bool = False) -> BudgetSnapshot:
     return BudgetSnapshot(
         configured=configured,
         day_tokens=TokenUsage(),
@@ -47,6 +47,7 @@ def budget(configured: bool = False, paused: bool = False) -> BudgetSnapshot:
         outstanding=0,
         paused=paused,
         extraction_allowed=False,
+        prices_configured=prices_configured,
     )
 
 
@@ -313,6 +314,34 @@ class ReportTests(unittest.TestCase):
         self.assertIn("暂停 是", budget_line)
         queue_line = next(line for line in rich if line.startswith("队列："))
         self.assertIn("聊天等待 3", queue_line)
+
+    def test_price_table_state_is_shown_only_when_amounts_are_set(self):
+        """R20 的可见性：金额已配置时，预算行同时说明价目表状态（S4-01）。"""
+        without_amounts = format_report(
+            HealthSnapshot(platform=health(), budget=budget(configured=False)), configured=True
+        )
+        self.assertFalse(any("价目表" in line for line in without_amounts))
+
+        missing_prices = format_report(
+            HealthSnapshot(platform=health(), budget=budget(configured=True)), configured=True
+        )
+        line = next(line for line in missing_prices if line.startswith("预算："))
+        self.assertIn("价目表 未配置（已配金额，模型请求会被保守拒绝）", line)
+
+        with_prices = format_report(
+            HealthSnapshot(
+                platform=health(), budget=budget(configured=True, prices_configured=True)
+            ),
+            configured=True,
+        )
+        line = next(line for line in with_prices if line.startswith("预算："))
+        self.assertIn("价目表 已配置", line)
+        self.assertIn("暂停 否", line)
+
+    def test_budget_snapshot_defaults_to_unknown_prices(self):
+        # 既有构造点不传价格时按"未知"处理——不能默认成"已配置"。
+        snapshot = budget(configured=True)
+        self.assertFalse(snapshot.prices_configured)
 
     def test_arguments_are_validated(self):
         snapshot = HealthSnapshot(platform=health())
