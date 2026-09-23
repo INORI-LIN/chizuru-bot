@@ -18,6 +18,7 @@ EXPECTED = {
     "记忆 开启": (CommandKind.MEMORY_ENABLE, Permission.SELF),
     "记忆 状态": (CommandKind.MEMORY_STATUS, Permission.SELF),
     "记忆 查看": (CommandKind.MEMORY_LIST, Permission.SELF),
+    "记忆 查看 确认": (CommandKind.MEMORY_LIST_CONFIRM, Permission.SELF),
     "记忆 关闭": (CommandKind.MEMORY_DISABLE, Permission.SELF),
     "记忆 删除全部": (CommandKind.MEMORY_DISABLE, Permission.SELF),
     "千鹤 暂停": (CommandKind.PAUSE, Permission.MAINTAINER),
@@ -51,7 +52,7 @@ class RequirementCoverageTests(unittest.TestCase):
 
 class PermissionTests(unittest.TestCase):
     def test_memory_commands_are_self_scoped(self):
-        for text in ("记忆 开启", "记忆 状态", "记忆 查看", "记忆 关闭", "记忆 删除全部"):
+        for text in ("记忆 开启", "记忆 状态", "记忆 查看", "记忆 查看 确认", "记忆 关闭", "记忆 删除全部"):
             self.assertEqual(parse(text).permission, Permission.SELF)
 
     def test_maintainer_commands_are_not_member_level(self):
@@ -65,6 +66,15 @@ class PermissionTests(unittest.TestCase):
             parse("群上下文 开启").kind,
             parse("群上下文 确认开启").kind,
         )
+
+    def test_memory_view_flow_both_steps_are_distinct(self):
+        # 需求 §4.4：查看是两步——先提示群内可见，确认后才列出。
+        first, second = parse("记忆 查看"), parse("记忆 查看 确认")
+        self.assertEqual(first.kind, CommandKind.MEMORY_LIST)
+        self.assertEqual(second.kind, CommandKind.MEMORY_LIST_CONFIRM)
+        self.assertNotEqual(first.kind, second.kind)
+        for intent in (first, second):
+            self.assertEqual(intent.permission, Permission.SELF)
 
 
 class ParameterizedTests(unittest.TestCase):
@@ -129,6 +139,8 @@ class UnknownTextTests(unittest.TestCase):
             "记忆 删除全部 3",
             "记忆开启",
             "记忆 开启 吧",
+            "记忆 查看确认",  # 缺分隔空格，不是已知指令
+            "记忆 查看 确认 一下",
             "帮助我",
             "帮助 我",
             "/help",

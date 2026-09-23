@@ -137,8 +137,9 @@ def admit(
 
     三道门槛分开表达，因为它们**来源不同、将来也会分开变化**：
 
-    - ``authorized``：成员在 `memory_state` 里的授权位（S3-03 落地前没有任何生产路径能
-      置位它）。**授权版本比对不在这里**——说明文案定稿后才有版本常量，属 S3-03。
+    - ``authorized``：成员在 `memory_state` 里的授权位**是否当前有效**；装配层用
+      `memory.consent.authorization_is_current` 把"说明版本比对"折叠进这个布尔值
+      （S3-03），因此旧版本的残留授权行到这里已经是 ``False``。
     - ``paused``：本群是否被暂停。调用方在**读不到策略时传 ``True``**："无法确认未暂停"
       就按已暂停处理（架构 §8.3 的记忆库失败行：不以"不用记忆"绕过未知权限）。
     - ``extraction_enabled`` 与 ``budget_allows``：前者是 `memory_extraction_enabled`

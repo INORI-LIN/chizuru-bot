@@ -44,20 +44,24 @@
   5 分钟待确认窗口，`群上下文 确认开启` 在窗口内同群同人时写入告知版本并开启采集
   （失败重发全文并重开窗口）；`群上下文 关闭` / `上下文 清空` / `千鹤 暂停/恢复`
   执行状态变更。
-- 群内出口有且只有两处：`千鹤 状态`（既有报告 + 一行群上下文状态）与 `群上下文 开启`
-  （含确认失败时的重发全文）。`上下文 退出/加入` 与 S2-05 的其余状态变更执行但**静默
-  无回执**；其余控制指令（记忆类与 `帮助`）不执行：回执文案属附录 C 待审范围，
-  执行属 S3-03/S3-04，此刻发明文案会先于评审。
+- 记忆授权与命令面（S3-03/S3-04）已接线：`记忆 开启` 逐字回复附录 C.2 说明全文并记录
+  待确认窗口，`记忆 确认开启` 在窗口内同群同人时写入授权行（带说明版本）；`记忆 查看`
+  先回附录 C.3 提示、确认后才列出本人记录；`记忆 状态/纠正/删除/关闭` 直接读写本人数据，
+  `记忆 关闭` 与 `记忆 删除全部` 等价（先撤权、再清空）。全部经 `FIXED_NOTICE` 出站，
+  因此**暂停群里的删除与关闭仍然可达**（需求 §4.4）。`帮助` 仍不执行（回执文案待审）。
+- 群内出口：`千鹤 状态`、`群上下文 开启`（含确认失败时的重发全文）、记忆类回执与列表、
+  以及 `@` 后的聊天回复。`上下文 退出/加入` 与 S2-05 的其余状态变更执行但**静默无回执**。
 - 存储路径来自 AstrBot 插件数据目录，**延迟建库**（不写不建文件）；解析或打开失败即
   降级为"无存储"，采集与退出/加入保持关闭，`千鹤 状态` 可见。
 - 去重窗口与容量是装配层常量，标注"建议参数待评审"——取值依赖仍未在线核验的 O-07。
 - 聊天失败不发任何群内提示：同样的理由（架构 §8.3 的失败文案属 S4-01）。
 - 记忆抽取（S3-07/S3-10）接在**回复流程之后**、同一次事件处理内 `await`（不建游离任务，
-  以保住装配测试的"无新增任务"不变量）：准入看授权位、暂停、总开关与预算门槛；写回在
-  单个短事务内重核修订号与授权、按"源消息 + 动作"去重。**这条路径没有任何出站**，
-  失败只记审计与计数，不影响已发送的回复。授权版本比对与成员授权入口属 S3-03。
-- `limits` 与 `budget` 在 `initialize()` 时固定，运行时改动需重载插件；身份、允许群、
-  维护者映射与金额开关每个事件重读（配置变更即时生效）。
+  以保住装配测试的"无新增任务"不变量）：准入看授权位（**含说明版本比对**，S3-03）、暂停、
+  总开关与预算门槛；写回在单个短事务内重核修订号与授权、按"源消息 + 动作"去重。**这条
+  路径没有任何出站**，失败只记审计与计数，不影响已发送的回复。
+- `limits`、`budget` 与两个记忆确认窗口在 `initialize()` 时固定（窗口取
+  `memory.auth_confirm_ttl_seconds`），运行时改动需重载插件；身份、允许群、维护者映射与
+  金额开关每个事件重读（配置变更即时生效）。
 
 **收口三件套**：`stop_event()` + `clear_result()` + `should_call_llm(True)`。前两者沿用
 骨架姿态，第三个才是抑制框架默认 LLM 链路的那一个（K5：`call_llm` 初值为 `False`，
@@ -144,6 +148,10 @@ class _Services:
     storage: storage.Storage | None
     context_buffer: ContextBuffer
     notice: notice.NoticeGate
+    memory_consent: memory.ConsentGate
+    """`记忆 开启` 的两步确认窗口（成员级）。"""
+    memory_view: memory.ConsentGate
+    """`记忆 查看` 的两步确认窗口（成员级）。与授权窗口是**两个实例**：互不作废。"""
 
 
 @dataclass(frozen=True)
@@ -266,6 +274,16 @@ class ChizuruPlugin(Star):
                 clock=self.clock,
             ),
             notice=notice.NoticeGate(clock=self.clock),
+            # 记忆的确认窗口取配置值（`auth_confirm_ttl_seconds`，默认 300 秒）；
+            # 群告知窗口保持 notice.py 的模块默认——那是 B1a 的独立参数，两者不互相借用。
+            memory_consent=memory.ConsentGate(
+                clock=self.clock,
+                window_seconds=settings.memory.auth_confirm_ttl_seconds,
+            ),
+            memory_view=memory.ConsentGate(
+                clock=self.clock,
+                window_seconds=settings.memory.auth_confirm_ttl_seconds,
+            ),
         )
         await self._sweep_history(settings)
 
@@ -423,8 +441,25 @@ class ChizuruPlugin(Star):
             commands.CommandKind.RESUME,
         ):
             await self._handle_group_control(event, facts, settings, services, intent)
+        elif intent.kind in (
+            commands.CommandKind.MEMORY_ENABLE,
+            commands.CommandKind.MEMORY_CONFIRM,
+        ):
+            await self._handle_memory_consent(event, facts, settings, services, intent)
+        elif intent.kind in (
+            commands.CommandKind.MEMORY_LIST,
+            commands.CommandKind.MEMORY_LIST_CONFIRM,
+        ):
+            await self._handle_memory_view(event, facts, settings, services, intent)
+        elif intent.kind in (
+            commands.CommandKind.MEMORY_STATUS,
+            commands.CommandKind.MEMORY_CORRECT,
+            commands.CommandKind.MEMORY_DELETE,
+            commands.CommandKind.MEMORY_DISABLE,
+        ):
+            await self._handle_memory_control(event, facts, settings, services, intent)
         else:
-            # 其余控制指令（记忆类与 帮助）的执行与文案属 S3-03/S3-04 与附录 C.2/C.3 待审范围。
+            # 只剩 `帮助`：回执文案属附录 C 待审范围，执行留待后续任务卡。
             self._audit(services, redact.EventCategory.IGNORED)
 
     # ---- 普通群聊采集（S2-03） ----
@@ -688,7 +723,7 @@ class ChizuruPlugin(Star):
             return None
         member = MemberKey(group, member_id)
         try:
-            if not stored.memories.state(member).authorized:
+            if not self._memory_authorized(stored, member):
                 return None
             facts = memory.retrieve(stored.memories, member)
         except storage.StorageFailure:
@@ -1036,9 +1071,14 @@ class ChizuruPlugin(Star):
 
     @staticmethod
     def _memory_authorized(stored: storage.Storage, member: MemberKey) -> bool:
-        """读授权位；**读不到一律按未授权处理**（后台写路径 fail-closed）。"""
+        """读授权位**并比对说明版本**（S3-03）；读不到或版本过期一律按未授权处理。
+
+        版本比对放在这里（消费点）而不是 `memory.pipeline.admit`：`CONSENT_VERSION` 是
+        进程内不变的常量，行一旦以当前版本写入就永远匹配；旧版本的残留行只会在升级重启后
+        出现，那时准入已经在调用侧被拒。后台写路径因此与本判定共用同一谓词。
+        """
         try:
-            return stored.memories.state(member).authorized
+            return memory.authorization_is_current(stored.memories.state(member))
         except storage.StorageFailure:
             return False
 
@@ -1435,6 +1475,375 @@ class ChizuruPlugin(Star):
         except storage.PolicyRefused:
             stored.groups.bump_revision(group)
             stored.groups.set_paused(group, paused=paused)
+
+    # ---- 控制：记忆授权与命令面（S3-03/S3-04） ----
+
+    async def _handle_memory_consent(
+        self,
+        event: AstrMessageEvent,
+        facts: MessageFacts,
+        settings: Settings,
+        services: _Services,
+        intent: commands.CommandIntent,
+    ) -> None:
+        """`记忆 开启` / `记忆 确认开启`：成员级两步授权（S3-03），文案逐字取自附录 C.2。
+
+        第一步只回复说明全文并记录待确认窗口（写入面不发生，也不建库）；第二步在窗口内
+        同群同人才写入授权行（带说明版本）。窗口不满足时**重发全文并重开窗口**——与
+        `群上下文 确认开启` 的失败语义完全一致，因此不需要任何额外失败文案。
+        """
+        group = self._group_key(facts)
+        member = MemberKey(group, facts.sender_id)
+        message_id = self._message_id(event)
+        if message_id is None:
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+        key = DedupKey(group=group, message_id=message_id, action=ActionKind.CHAT_REPLY)
+        if services.dedup.begin(key) is not Claim.FIRST:
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+        if not authorize(intent, facts, settings).allowed:
+            services.dedup.release(key)
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+
+        if intent.kind is commands.CommandKind.MEMORY_ENABLE:
+            services.dedup.finish(key, await self._show_consent(event, facts, settings, services, group, member))
+            return
+
+        confirmed = services.memory_consent.confirm(
+            member,
+            actor_id=facts.sender_id,
+            version=memory.CONSENT_VERSION,
+        )
+        if confirmed is not memory.ConsentOutcome.CONFIRMED:
+            services.dedup.finish(key, await self._show_consent(event, facts, settings, services, group, member))
+            return
+
+        stored = self._memory_store(services)
+        if stored is None:
+            services.dedup.finish(
+                key, await self._reply_memory_unavailable(event, facts, settings, services, group, message_id)
+            )
+            return
+        try:
+            stored.memories.set_authorized(member, authorized=True, auth_version=memory.CONSENT_VERSION)
+        except storage.StorageFailure:
+            services.dedup.finish(
+                key, await self._reply_memory_unavailable(event, facts, settings, services, group, message_id)
+            )
+            return
+        services.dedup.finish(
+            key, await self._reply_memory(event, facts, settings, services, group, memory.CONFIRM_SUCCESS_TEXT)
+        )
+
+    async def _handle_memory_view(
+        self,
+        event: AstrMessageEvent,
+        facts: MessageFacts,
+        settings: Settings,
+        services: _Services,
+        intent: commands.CommandIntent,
+    ) -> None:
+        """`记忆 查看` / `记忆 查看 确认`：两步查看（S3-04），先提示群内可见再列出。
+
+        第一步**先确认授权再回提示**（未开启时不引导查看）；第二步**重新读一次**再列出——
+        窗口与读取之间可能已经撤回或过期，列出陈旧内容等于绕过撤回。
+        """
+        group = self._group_key(facts)
+        member = MemberKey(group, facts.sender_id)
+        message_id = self._message_id(event)
+        if message_id is None:
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+        key = DedupKey(group=group, message_id=message_id, action=ActionKind.CHAT_REPLY)
+        if services.dedup.begin(key) is not Claim.FIRST:
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+        if not authorize(intent, facts, settings).allowed:
+            services.dedup.release(key)
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+
+        snapshot = self._memory_snapshot(services, member)
+        if snapshot is None:
+            services.dedup.finish(
+                key, await self._reply_memory_unavailable(event, facts, settings, services, group, message_id)
+            )
+            return
+        authorized, _records = snapshot
+        if not authorized:
+            services.dedup.finish(
+                key, await self._reply_memory(event, facts, settings, services, group, memory.STATUS_CLOSED_TEXT)
+            )
+            return
+
+        if intent.kind is commands.CommandKind.MEMORY_LIST:
+            services.dedup.finish(key, await self._show_view_notice(event, facts, settings, services, group, member))
+            return
+
+        confirmed = services.memory_view.confirm(
+            member,
+            actor_id=facts.sender_id,
+            version=memory.VIEW_NOTICE_VERSION,
+        )
+        if confirmed is not memory.ConsentOutcome.CONFIRMED:
+            services.dedup.finish(key, await self._show_view_notice(event, facts, settings, services, group, member))
+            return
+
+        snapshot = self._memory_snapshot(services, member)
+        if snapshot is None:
+            services.dedup.finish(
+                key, await self._reply_memory_unavailable(event, facts, settings, services, group, message_id)
+            )
+            return
+        authorized, records = snapshot
+        if not authorized:
+            services.dedup.finish(
+                key, await self._reply_memory(event, facts, settings, services, group, memory.STATUS_CLOSED_TEXT)
+            )
+            return
+        services.dedup.finish(
+            key,
+            await self._reply_memory(
+                event, facts, settings, services, group, memory.list_body(records), count=len(records)
+            ),
+        )
+
+    async def _handle_memory_control(
+        self,
+        event: AstrMessageEvent,
+        facts: MessageFacts,
+        settings: Settings,
+        services: _Services,
+        intent: commands.CommandIntent,
+    ) -> None:
+        """`记忆 状态/纠正/删除/关闭/删除全部`：直接读写本人数据（S3-04）。
+
+        `记忆 关闭` 与 `记忆 删除全部` 是**同一 kind**：需求 §4.4 与附录 C.2 都写作
+        "均撤回授权并清除已有记忆"，因此等价实现，顺序固定为**先撤权、再清空**——反过来
+        会留下"仍授权、无记录"的窗口，抽取可能立刻写回新记录。该分支**不要求当前已授权**：
+        对"已撤回但事实残留"的成员，关闭与删除必须仍然可用。
+        """
+        group = self._group_key(facts)
+        member = MemberKey(group, facts.sender_id)
+        message_id = self._message_id(event)
+        if message_id is None:
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+        key = DedupKey(group=group, message_id=message_id, action=ActionKind.CHAT_REPLY)
+        if services.dedup.begin(key) is not Claim.FIRST:
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+        if not authorize(intent, facts, settings).allowed:
+            services.dedup.release(key)
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+
+        if intent.kind is commands.CommandKind.MEMORY_STATUS:
+            snapshot = self._memory_snapshot(services, member)
+            if snapshot is None:
+                services.dedup.finish(
+                    key, await self._reply_memory_unavailable(event, facts, settings, services, group, message_id)
+                )
+                return
+            authorized, records = snapshot
+            text = memory.status_line(
+                authorized=authorized,
+                count=len(records),
+                limit=settings.memory.max_records_per_member,
+                days=settings.memory.ttl_days,
+            )
+            services.dedup.finish(
+                key,
+                await self._reply_memory(
+                    event, facts, settings, services, group, text, count=len(records) if authorized else None
+                ),
+            )
+            return
+
+        if intent.kind is commands.CommandKind.MEMORY_CORRECT:
+            stored = self._memory_store(services)
+            if stored is None:
+                services.dedup.finish(
+                    key, await self._reply_memory_unavailable(event, facts, settings, services, group, message_id)
+                )
+                return
+            record_id = int(intent.record_id)
+            content = memory.prepare_source(intent.argument)
+            if content is None:
+                services.dedup.finish(
+                    key, await self._reply_memory(event, facts, settings, services, group, memory.CORRECT_REFUSED_TEXT)
+                )
+                return
+            try:
+                updated = stored.memories.correct(member, record_id, content=content)
+            except ValueError:
+                # 编号超出存储层上界：与"没有找到"同一回执（不区分原因）。
+                updated = None
+            except storage.StorageFailure:
+                services.dedup.finish(
+                    key, await self._reply_memory_unavailable(event, facts, settings, services, group, message_id)
+                )
+                return
+            text = memory.record_updated(record_id) if updated is not None else memory.record_missing(record_id)
+            services.dedup.finish(key, await self._reply_memory(event, facts, settings, services, group, text))
+            return
+
+        if intent.kind is commands.CommandKind.MEMORY_DELETE:
+            stored = self._memory_store(services)
+            if stored is None:
+                services.dedup.finish(
+                    key, await self._reply_memory_unavailable(event, facts, settings, services, group, message_id)
+                )
+                return
+            record_id = int(intent.record_id)
+            try:
+                deleted = stored.memories.delete(member, record_id)
+            except ValueError:
+                deleted = False
+            except storage.StorageFailure:
+                services.dedup.finish(
+                    key, await self._reply_memory_unavailable(event, facts, settings, services, group, message_id)
+                )
+                return
+            text = memory.record_deleted(record_id) if deleted else memory.record_missing(record_id)
+            services.dedup.finish(key, await self._reply_memory(event, facts, settings, services, group, text))
+            return
+
+        # 记忆 关闭 / 记忆 删除全部（等价）。
+        stored = self._memory_store(services)
+        if stored is None:
+            services.dedup.finish(
+                key, await self._reply_memory_unavailable(event, facts, settings, services, group, message_id)
+            )
+            return
+        try:
+            stored.memories.set_authorized(member, authorized=False, auth_version=memory.CONSENT_VERSION)
+            stored.memories.clear(member)
+        except storage.StorageFailure:
+            # 撤权已生效但清空未完成时也如实回这一句：**不虚报已清除**（架构 §8.3）。
+            services.dedup.finish(
+                key, await self._reply_memory_unavailable(event, facts, settings, services, group, message_id)
+            )
+            return
+        services.dedup.finish(
+            key, await self._reply_memory(event, facts, settings, services, group, memory.DISABLE_SUCCESS_TEXT)
+        )
+
+    def _memory_snapshot(
+        self,
+        services: _Services,
+        member: MemberKey,
+    ) -> tuple[bool, tuple[storage.MemoryFact, ...]] | None:
+        """(授权是否当前有效, 未过期记录)；无存储、库降级或读失败一律返回 `None`。
+
+        "读失败"与"未授权"刻意分开：库坏了要如实说"暂时不可用"，不能显示成"你没开"
+        （架构 §8.3：不以"未知"换放行）。
+        """
+        stored = self._memory_store(services)
+        if stored is None:
+            return None
+        try:
+            authorized = memory.authorization_is_current(stored.memories.state(member))
+            records = stored.memories.facts(member) if authorized else ()
+        except storage.StorageFailure:
+            return None
+        return authorized, records
+
+    async def _show_consent(
+        self,
+        event: AstrMessageEvent,
+        facts: MessageFacts,
+        settings: Settings,
+        services: _Services,
+        group: GroupKey,
+        member: MemberKey,
+    ) -> Outcome:
+        """回复授权说明全文；**送达成功才记录待确认窗口**（S3-03 步骤 1）。"""
+        outcome, sent = await self._deliver_memory(event, facts, settings, services, group, memory.CONSENT_TEXT)
+        if sent:
+            services.memory_consent.begin(
+                member,
+                actor_id=facts.sender_id,
+                version=memory.CONSENT_VERSION,
+            )
+        self._audit(services, redact.EventCategory.MEMORY_OP)
+        return outcome
+
+    async def _show_view_notice(
+        self,
+        event: AstrMessageEvent,
+        facts: MessageFacts,
+        settings: Settings,
+        services: _Services,
+        group: GroupKey,
+        member: MemberKey,
+    ) -> Outcome:
+        """回复查看提示；**送达成功才记录待确认窗口**（S3-04 步骤 1）。"""
+        outcome, sent = await self._deliver_memory(event, facts, settings, services, group, memory.VIEW_NOTICE_TEXT)
+        if sent:
+            services.memory_view.begin(
+                member,
+                actor_id=facts.sender_id,
+                version=memory.VIEW_NOTICE_VERSION,
+            )
+        self._audit(services, redact.EventCategory.MEMORY_OP)
+        return outcome
+
+    async def _deliver_memory(
+        self,
+        event: AstrMessageEvent,
+        facts: MessageFacts,
+        settings: Settings,
+        services: _Services,
+        group: GroupKey,
+        text: str,
+    ) -> tuple[Outcome, bool]:
+        """记忆类回执的统一出口：与 `千鹤 状态` 同例（固定提示、不走模型）。
+
+        `FIXED_NOTICE` 不受暂停约束（`_group_state`），因此暂停期里成员的删除与关闭
+        仍然可达——需求 §4.4"暂停时保留成员删除通道"。
+        """
+        return await self._deliver(
+            event,
+            facts,
+            settings,
+            services,
+            group,
+            text,
+            kind=SendKind.FIXED_NOTICE,
+            llm_invoked=False,
+        )
+
+    async def _reply_memory(
+        self,
+        event: AstrMessageEvent,
+        facts: MessageFacts,
+        settings: Settings,
+        services: _Services,
+        group: GroupKey,
+        text: str,
+        *,
+        count: int | None = None,
+    ) -> Outcome:
+        """回一条记忆类消息并登记审计；返回去重结论（门控丢弃与送达同为 COMPLETED）。"""
+        outcome, _ = await self._deliver_memory(event, facts, settings, services, group, text)
+        self._audit(services, redact.EventCategory.MEMORY_OP, count=count)
+        return outcome
+
+    async def _reply_memory_unavailable(
+        self,
+        event: AstrMessageEvent,
+        facts: MessageFacts,
+        settings: Settings,
+        services: _Services,
+        group: GroupKey,
+        message_id: str,
+    ) -> Outcome:
+        """库不可用或写失败：置降级 + 审计，并**如实回复"没有完成"**（架构 §8.3）。"""
+        self._storage_failed(services, facts, message_id, category=redact.EventCategory.MEMORY_OP)
+        return await self._reply_memory(event, facts, settings, services, group, memory.UNAVAILABLE_TEXT)
 
     def _storage_failed(
         self,

@@ -40,7 +40,8 @@ CATEGORY_LABELS: Mapping[Category, str] = {
     Category.INTEREST: "一般兴趣",
     Category.ACTIVITY: "非敏感活动偏好",
 }
-"""类别名**逐字取自需求 §4.3 的"可保存"表**，不新增措辞。**属待评审文本。**"""
+"""类别名**逐字取自需求 §4.3 的"可保存"表**，不新增措辞；群内列表（``consent.render_records``）
+与注入块（``render_lines``）共用同一份取值。"""
 
 
 def retrieve(store: MemoryStore, member: MemberKey) -> tuple[MemoryFact, ...]:
@@ -64,7 +65,7 @@ def render_lines(facts: Sequence[MemoryFact]) -> tuple[str, ...]:
     """
     lines: list[str] = []
     for fact in facts:
-        label = _label_of(fact.category)
+        label = category_label(fact.category)
         if label is None:
             continue
         content = sanitize_material_text(fact.content)
@@ -82,7 +83,12 @@ def render_block(facts: Sequence[MemoryFact]) -> TextBlock | None:
     return TextBlock(title=MEMORY_BLOCK_TITLE, lines=lines)
 
 
-def _label_of(value: object) -> str | None:
+def category_label(value: object) -> str | None:
+    """类别的展示名；不在白名单内返回 ``None``。
+
+    群内列表（``consent.render_records``）与注入块（``render_lines``）共用同一份取值，
+    保证两处不会各持一份类别名。
+    """
     try:
         category = Category(value)
     except ValueError:

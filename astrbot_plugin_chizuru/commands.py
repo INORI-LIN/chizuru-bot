@@ -26,6 +26,7 @@ class CommandKind(StrEnum):
     MEMORY_CONFIRM = "memory_confirm"
     MEMORY_STATUS = "memory_status"
     MEMORY_LIST = "memory_list"
+    MEMORY_LIST_CONFIRM = "memory_list_confirm"
     MEMORY_CORRECT = "memory_correct"
     MEMORY_DELETE = "memory_delete"
     MEMORY_DISABLE = "memory_disable"
@@ -68,6 +69,7 @@ _EXACT: dict[str, tuple[CommandKind, Permission]] = {
     "记忆 确认开启": (CommandKind.MEMORY_CONFIRM, Permission.SELF),
     "记忆 状态": (CommandKind.MEMORY_STATUS, Permission.SELF),
     "记忆 查看": (CommandKind.MEMORY_LIST, Permission.SELF),
+    "记忆 查看 确认": (CommandKind.MEMORY_LIST_CONFIRM, Permission.SELF),
     "记忆 关闭": (CommandKind.MEMORY_DISABLE, Permission.SELF),
     "记忆 删除全部": (CommandKind.MEMORY_DISABLE, Permission.SELF),
     "群上下文 开启": (CommandKind.GROUP_NOTICE_OPEN, Permission.MAINTAINER),

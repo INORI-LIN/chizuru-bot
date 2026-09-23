@@ -193,12 +193,16 @@ class AssemblyTestCase(unittest.IsolatedAsyncioTestCase):
         return self.plugin.services.context_buffer.entries(self.group_key(group_id))
 
     def authorize_memory(
-        self, member_id: str = "30001", *, group_id: str = "20001", version: str = "auth-1"
+        self, member_id: str = "30001", *, group_id: str = "20001", version: str | None = None
     ):
-        """直接写授权行模拟 S3-03 完成两级授权；授权流程与记忆命令仍由 S3-03/S3-04 交付。"""
+        """直接写授权行，模拟"已完成两级授权"的下游状态；**不作为 S3-03 的验收证据**。
+
+        版本默认取 `memory.CONSENT_VERSION`：消费点会比对说明版本，写旧版本会被正确判定为
+        未授权（见 `test_stale_authorization_version_is_treated_as_closed`）。
+        """
         member = plugin_module.MemberKey(self.group_key(group_id), member_id)
         return self.plugin.services.storage.memories.set_authorized(
-            member, authorized=True, auth_version=version
+            member, authorized=True, auth_version=plugin_module.memory.CONSENT_VERSION if version is None else version
         )
 
     def memory_facts(self, member_id: str = "30001", *, group_id: str = "20001"):
@@ -529,11 +533,12 @@ class StatusCommandTests(AssemblyTestCase):
         self.assertEqual(provider.calls, [])
 
     async def test_other_commands_are_silent(self):
-        """**行为分化（S2-05）**：`群上下文 开启` 已改为回复告知全文（见
-        `MaintainerCommandTests`），不再是零出站；本用例保留其余仍静默的指令。"""
+        """**行为分化（S2-05 / 3f）**：`群上下文 开启` 已改为回复告知全文（见
+        `MaintainerCommandTests`），记忆类命令已改为有回执（见 `MemoryConsentCommandTests`）；
+        本用例保留其余仍静默的指令。"""
         provider = fakes.FakeProvider()
         await self.start(provider=provider, platform=fakes.FakePlatform())
-        for text in ("帮助", "上下文 退出", "记忆 开启", "千鹤 暂停"):
+        for text in ("帮助", "上下文 退出", "千鹤 暂停"):
             with self.subTest(command=text):
                 await self.plugin.on_message(self.mention(text, message_id=f"event-{text}"))
                 self.assertEqual(self.sent, [])
@@ -2013,6 +2018,323 @@ class MemoryRobustnessTests(AssemblyTestCase):
         self.assertEqual(sent, [])
         self.assertEqual(store.saves, [])
         self.assertEqual(len(provider.calls), 1)
+
+
+class MemoryConsentCommandTests(AssemblyTestCase):
+    """S3-03/S3-04：记忆授权两步确认与记忆命令面（附录 C.2/C.3、需求 §4.4）。
+
+    与 `MemoryExtractionTests` 的分工：那一批只验证"已授权的链路"，本批验证**授权的入口
+    本身**与随之可用的命令面——授权行由命令写入，不再由用例代写（A07/A09 的离线部分）。
+    """
+
+    async def start_memory(self, *, provider=None, config=None):
+        await self.start(
+            provider=provider or fakes.FakeProvider(),
+            storage_path=self.new_storage_path(),
+            history_cleaner=fakes.FakeHistoryCleaner(),
+            history_store=fakes.FakeHistoryStore(),
+            config=config,
+        )
+
+    def member(self, member_id: str = "30001", group_id: str = "20001"):
+        return plugin_module.MemberKey(self.group_key(group_id), member_id)
+
+    def stored_state(self):
+        """直接读库核对授权行（授权位与说明版本）——回执之外的可追溯证据。"""
+        import sqlite3
+
+        connection = sqlite3.connect(self.plugin.storage_path)
+        try:
+            return connection.execute("SELECT authorized, auth_version FROM memory_state").fetchone()
+        finally:
+            connection.close()
+
+    # ---- S3-03：两级授权 ----
+
+    async def test_enable_replies_with_the_approved_text_and_writes_nothing(self):
+        await self.start_memory()
+        await self.plugin.on_message(self.mention("记忆 开启"))
+
+        self.assertEqual([text_of(message) for message in self.sent], [plugin_module.memory.CONSENT_TEXT])
+        # 步骤 1 只回复文案：不建库、不写授权行（读取同样不建文件）。
+        self.assertFalse(self.plugin.storage_path.exists())
+
+    async def test_confirm_within_the_window_writes_the_current_version(self):
+        await self.start_memory()
+        await self.plugin.on_message(self.mention("记忆 开启", message_id="open-1"))
+        await self.plugin.on_message(self.mention("记忆 确认开启", message_id="confirm-1"))
+
+        self.assertEqual(text_of(self.sent[0]), plugin_module.memory.CONFIRM_SUCCESS_TEXT)
+        self.assertEqual(self.stored_state(), (1, plugin_module.memory.CONSENT_VERSION))
+        # 授权变更走同一成员修订号（S3-09 的既有取舍）。
+        self.assertEqual(self.plugin.services.storage.members.revision(self.member()), 1)
+
+    async def test_expired_confirmation_resends_the_text_and_can_be_retried(self):
+        await self.start_memory()
+        await self.plugin.on_message(self.mention("记忆 开启", message_id="open-1"))
+        self.clock.advance(plugin_module.memory.CONSENT_WINDOW_SECONDS + 1)
+
+        await self.plugin.on_message(self.mention("记忆 确认开启", message_id="confirm-1"))
+        self.assertEqual(text_of(self.sent[0]), plugin_module.memory.CONSENT_TEXT)
+        self.assertFalse(self.plugin.services.storage.memories.state(self.member()).authorized)
+
+        # 重发同时重开了窗口：立刻再确认即成功（与 `群上下文 确认开启` 同语义）。
+        await self.plugin.on_message(self.mention("记忆 确认开启", message_id="confirm-2"))
+        self.assertTrue(self.plugin.services.storage.memories.state(self.member()).authorized)
+
+    async def test_confirm_without_a_window_resends_the_text(self):
+        await self.start_memory()
+        await self.plugin.on_message(self.mention("记忆 确认开启"))
+
+        self.assertEqual(text_of(self.sent[0]), plugin_module.memory.CONSENT_TEXT)
+        self.assertFalse(self.plugin.services.storage.memories.state(self.member()).authorized)
+
+    async def test_another_member_cannot_confirm_for_the_requester(self):
+        await self.start_memory()
+        await self.plugin.on_message(self.mention("记忆 开启", sender_id="30001", message_id="open-1"))
+        await self.plugin.on_message(self.mention("记忆 确认开启", sender_id="30002", message_id="confirm-1"))
+
+        # 代确认只换来同一句失败重发；发起人与代确认者都保持未授权。
+        self.assertEqual(text_of(self.sent[0]), plugin_module.memory.CONSENT_TEXT)
+        self.assertFalse(self.plugin.services.storage.memories.state(self.member("30001")).authorized)
+        self.assertFalse(self.plugin.services.storage.memories.state(self.member("30002")).authorized)
+
+    async def test_the_window_follows_the_configured_ttl(self):
+        await self.start_memory(config=make_config(auth_confirm_ttl_seconds=60))
+        await self.plugin.on_message(self.mention("记忆 开启", message_id="open-1"))
+
+        self.clock.advance(60)  # 取严：恰好到期即过期
+        await self.plugin.on_message(self.mention("记忆 确认开启", message_id="confirm-1"))
+        self.assertEqual(text_of(self.sent[0]), plugin_module.memory.CONSENT_TEXT)
+        self.assertFalse(self.plugin.services.storage.memories.state(self.member()).authorized)
+
+    async def test_duplicate_event_runs_once(self):
+        await self.start_memory()
+        await self.plugin.on_message(self.mention("记忆 开启", message_id="dup"))
+        first = list(self.sent)
+        await self.plugin.on_message(self.mention("记忆 开启", message_id="dup"))
+        self.assertEqual(len(first), 1)
+        self.assertEqual(self.sent, [])  # 第二次同 message_id：不再出站
+
+    async def test_enable_still_works_when_the_store_is_unavailable(self):
+        await self.start_memory()
+        self.plugin.services.health.set_degraded(plugin_module.health.Degradation.MEMORY_STORE_FAILED)
+
+        await self.plugin.on_message(self.mention("记忆 开启"))
+        # 说明与窗口都不依赖存储：库坏了仍然要能读到授权说明。
+        self.assertEqual(text_of(self.sent[0]), plugin_module.memory.CONSENT_TEXT)
+        self.assertIsNotNone(self.plugin.services.memory_consent.pending(self.member()))
+
+    # ---- 授权版本（S3-03 的消费点比对） ----
+
+    async def test_stale_authorization_version_is_treated_as_closed(self):
+        provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="嗯，我在。")])
+        await self.start_extraction(provider=provider, authorized=False)
+        self.authorize_memory(version="consent-0")
+        self.seed_fact(content="叫我小林")
+
+        await self.plugin.on_message(self.mention("记忆 状态", message_id="status-1"))
+        self.assertEqual(text_of(self.sent[0]), plugin_module.memory.STATUS_CLOSED_TEXT)
+
+        await self.plugin.on_message(self.mention("叫我小林就好", message_id="m-1"))
+        # 旧版本的残留授权行：既不注入记忆，也不抽取（只有一次聊天调用）。
+        parts = "".join(part.text for part in provider.calls[0]["extra_user_content_parts"])
+        self.assertNotIn("【本人记忆·临时材料】", parts)
+        self.assertEqual(len(provider.calls), 1)
+
+    # ---- S3-04：状态与查看 ----
+
+    async def test_status_reports_closed_before_authorization(self):
+        await self.start_memory()
+        await self.plugin.on_message(self.mention("记忆 状态"))
+        self.assertEqual(text_of(self.sent[0]), plugin_module.memory.STATUS_CLOSED_TEXT)
+
+    async def test_status_reports_counts_and_validity(self):
+        await self.start_memory()
+        self.authorize_memory()
+        self.seed_fact(content="叫我小林", source="seed-1")
+        self.seed_fact(category="interest", content="看番", source="seed-2")
+
+        await self.plugin.on_message(self.mention("记忆 状态"))
+        self.assertEqual(text_of(self.sent[0]), "长期记忆：已开启；记录 2 条（最多 20 条），90 天后失效。")
+
+    async def test_view_requires_two_steps_and_never_lists_on_the_first(self):
+        await self.start_memory()
+        self.authorize_memory()
+        self.seed_fact(content="叫我小林")
+
+        await self.plugin.on_message(self.mention("记忆 查看", message_id="list-1"))
+        self.assertEqual(text_of(self.sent[0]), plugin_module.memory.VIEW_NOTICE_TEXT)
+        self.assertNotIn("叫我小林", text_of(self.sent[0]))
+
+        await self.plugin.on_message(self.mention("记忆 查看 确认", message_id="list-2"))
+        self.assertEqual(
+            text_of(self.sent[0]),
+            "【你在本群的记忆记录】\n\n· 1：本人希望的称呼：叫我小林\n\n"
+            "要删除或纠正某条记录，@ 我发送「记忆 删除 <编号>」或「记忆 纠正 <编号> <新内容>」。",
+        )
+
+    async def test_view_confirm_without_a_window_resends_the_notice(self):
+        await self.start_memory()
+        self.authorize_memory()
+        await self.plugin.on_message(self.mention("记忆 查看 确认"))
+        self.assertEqual(text_of(self.sent[0]), plugin_module.memory.VIEW_NOTICE_TEXT)
+
+    async def test_view_without_authorization_points_to_the_consent_text(self):
+        await self.start_memory()
+        await self.plugin.on_message(self.mention("记忆 查看"))
+        # 未开启时不引导查看（fail-closed）：只回状态行，不回 C.3 提示。
+        self.assertEqual(text_of(self.sent[0]), plugin_module.memory.STATUS_CLOSED_TEXT)
+
+    async def test_empty_list_is_explicit(self):
+        await self.start_memory()
+        self.authorize_memory()
+        await self.plugin.on_message(self.mention("记忆 查看", message_id="list-1"))
+        await self.plugin.on_message(self.mention("记忆 查看 确认", message_id="list-2"))
+        self.assertEqual(
+            text_of(self.sent[0]),
+            f"{plugin_module.memory.LIST_TITLE}\n\n{plugin_module.memory.LIST_EMPTY_TEXT}",
+        )
+
+    # ---- S3-04：纠正 / 删除 / 关闭 ----
+
+    async def test_correct_replaces_content_and_marks_it_manual(self):
+        await self.start_memory()
+        self.authorize_memory()
+        self.seed_fact(content="叫我小林")
+
+        await self.plugin.on_message(self.mention("记忆 纠正 1 叫我小林就好", message_id="c-1"))
+        self.assertEqual(text_of(self.sent[0]), plugin_module.memory.record_updated(1))
+        fact = self.memory_facts()[0]
+        self.assertEqual((fact.content, fact.origin), ("叫我小林就好", "manual"))
+
+    async def test_correct_refuses_sensitive_content_and_unknown_ids(self):
+        await self.start_memory()
+        self.authorize_memory()
+        self.seed_fact(content="叫我小林")
+
+        await self.plugin.on_message(self.mention("记忆 纠正 1 我的手机号 13800138000", message_id="c-1"))
+        self.assertEqual(text_of(self.sent[0]), plugin_module.memory.CORRECT_REFUSED_TEXT)
+
+        await self.plugin.on_message(self.mention("记忆 纠正 9 别的说法", message_id="c-2"))
+        self.assertEqual(text_of(self.sent[0]), plugin_module.memory.record_missing(9))
+        self.assertEqual(self.memory_facts()[0].content, "叫我小林")
+
+    async def test_delete_removes_one_record_and_second_attempt_is_not_found(self):
+        await self.start_memory()
+        self.authorize_memory()
+        self.seed_fact(content="叫我小林")
+
+        await self.plugin.on_message(self.mention("记忆 删除 1", message_id="d-1"))
+        self.assertEqual(text_of(self.sent[0]), plugin_module.memory.record_deleted(1))
+        self.assertEqual(self.memory_facts(), ())
+
+        await self.plugin.on_message(self.mention("记忆 删除 1", message_id="d-2"))
+        self.assertEqual(text_of(self.sent[0]), plugin_module.memory.record_missing(1))
+
+    async def test_memory_commands_reach_the_member_while_paused(self):
+        await self.start_memory()
+        self.authorize_memory()
+        self.seed_fact(content="叫我小林")
+        self.open_group()
+        self.plugin.services.storage.groups.set_paused(self.group_key(), paused=True)
+
+        await self.plugin.on_message(self.mention("记忆 删除 1", message_id="d-1"))
+        # 需求 §4.4："暂停和模型故障不应阻止有效 @ 下的成员删除请求。"
+        self.assertEqual(text_of(self.sent[0]), plugin_module.memory.record_deleted(1))
+
+    async def test_close_clears_records_and_stops_future_extraction(self):
+        provider = fakes.FakeProvider(
+            script=[
+                fakes.FakeLLMResponse(text="嗯，我在。"),
+                fakes.FakeLLMResponse(text='[{"category": "interest", "content": "看番"}]'),
+                fakes.FakeLLMResponse(text="嗯，在的。"),
+            ]
+        )
+        await self.start_extraction(provider=provider)
+        self.seed_fact(content="叫我小林")
+
+        await self.plugin.on_message(self.mention("记忆 关闭", message_id="close-1"))
+        self.assertEqual(text_of(self.sent[0]), plugin_module.memory.DISABLE_SUCCESS_TEXT)
+        self.assertFalse(self.plugin.services.storage.memories.state(self.member()).authorized)
+        self.assertEqual(self.memory_facts(), ())
+
+        # 关闭之后：本人 @ 原话既不注入也不抽取（只有那一次聊天调用）。
+        await self.plugin.on_message(self.mention("我喜欢看番", message_id="m-1"))
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(self.memory_facts(), ())
+
+    async def test_close_and_delete_all_are_equivalent(self):
+        for command in ("记忆 关闭", "记忆 删除全部"):
+            with self.subTest(command=command):
+                await self.start_memory()
+                self.authorize_memory()
+                self.seed_fact(content="叫我小林")
+
+                await self.plugin.on_message(self.mention(command, message_id="close-1"))
+                self.assertEqual(text_of(self.sent[0]), plugin_module.memory.DISABLE_SUCCESS_TEXT)
+                self.assertFalse(self.plugin.services.storage.memories.state(self.member()).authorized)
+                self.assertEqual(self.memory_facts(), ())
+                await self.plugin.terminate()
+
+    async def test_revocation_survives_restart(self):
+        path = self.new_storage_path()
+        await self.start(
+            provider=fakes.FakeProvider(),
+            storage_path=path,
+            history_cleaner=fakes.FakeHistoryCleaner(),
+            history_store=fakes.FakeHistoryStore(),
+        )
+        self.authorize_memory()
+        self.seed_fact(content="叫我小林")
+        await self.plugin.on_message(self.mention("记忆 关闭", message_id="close-1"))
+        await self.plugin.terminate()
+
+        # 同一存储路径重启：撤回与清空都持久化，不因重启复活。
+        await self.start(
+            provider=fakes.FakeProvider(),
+            storage_path=path,
+            history_cleaner=fakes.FakeHistoryCleaner(),
+            history_store=fakes.FakeHistoryStore(),
+        )
+        await self.plugin.on_message(self.mention("记忆 状态", message_id="status-1"))
+        self.assertEqual(text_of(self.sent[0]), plugin_module.memory.STATUS_CLOSED_TEXT)
+        self.assertEqual(self.memory_facts(), ())
+
+    async def test_a_degraded_store_replies_unavailable_without_faking_success(self):
+        await self.start_memory()
+        self.authorize_memory()
+        self.seed_fact(content="叫我小林")
+        self.plugin.services.health.set_degraded(plugin_module.health.Degradation.MEMORY_STORE_FAILED)
+
+        await self.plugin.on_message(self.mention("记忆 删除 1", message_id="d-1"))
+        self.assertEqual(text_of(self.sent[0]), plugin_module.memory.UNAVAILABLE_TEXT)
+        # 不虚报已删除：降级期间不做读写，记录仍在。
+        self.assertEqual(len(self.memory_facts()), 1)
+
+    async def test_consent_makes_later_extraction_possible_and_is_not_retroactive(self):
+        provider = fakes.FakeProvider(
+            script=[
+                fakes.FakeLLMResponse(text="嗯，我在。"),
+                fakes.FakeLLMResponse(text='[{"category": "interest", "content": "看番"}]'),
+            ]
+        )
+        await self.start_extraction(provider=provider, authorized=False)
+
+        # A07 的离线部分：两步确认之后才有抽取；确认本身不调用模型。
+        await self.plugin.on_message(self.mention("记忆 开启", message_id="open-1"))
+        consent = [text_of(message) for message in self.sent]
+        await self.plugin.on_message(self.mention("记忆 确认开启", message_id="confirm-1"))
+        confirmed = [text_of(message) for message in self.sent]
+        self.assertEqual(consent, [plugin_module.memory.CONSENT_TEXT])
+        self.assertEqual(confirmed, [plugin_module.memory.CONFIRM_SUCCESS_TEXT])
+        self.assertTrue(self.plugin.services.storage.memories.state(self.member()).authorized)
+        self.assertEqual(provider.calls, [])  # 授权流程零模型调用
+        self.assertEqual(self.memory_facts(), ())  # 也不追溯授权之前
+
+        await self.plugin.on_message(self.mention("我喜欢看番", message_id="m-1"))
+        self.assertEqual(len(provider.calls), 2)
+        self.assertEqual([fact.content for fact in self.memory_facts()], ["看番"])
 
 
 if __name__ == "__main__":

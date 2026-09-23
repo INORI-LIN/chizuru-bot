@@ -307,8 +307,9 @@ class MemoryStore:
     ) -> AuthorizationTransition:
         """授权 / 撤回授权，并在同一事务内把成员修订号 +1；等值重复调用幂等。
 
-        撤回时清空授权版本（没有生效中的说明）；不删除事实——"关闭"与"删除全部"是否
-        连动属命令语义（S3-04），由调用方组合本方法与 :meth:`clear`。
+        撤回时清空授权版本（没有生效中的说明）；不删除事实——**本层不预判命令语义**，
+        "关闭"与"删除全部"的连动由调用方组合本方法与 :meth:`clear`（S3-04 定为等价：
+        先撤权、再清空）。
         """
         if not isinstance(authorized, bool):
             raise ValueError("authorized 必须是布尔值")
