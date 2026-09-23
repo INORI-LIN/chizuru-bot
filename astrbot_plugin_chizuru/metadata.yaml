@@ -1,7 +1,7 @@
 name: astrbot_plugin_chizuru
-display_name: 千鹤（离线骨架）
+display_name: 千鹤（未上线）
 author: chizuru project
-desc: 非官方水原千鹤角色插件骨架。“水原千鹤是个好女孩”。当前不回复、不采集、不调用模型，仅用于专用离线开发实例。
+desc: 非官方水原千鹤角色插件。“水原千鹤是个好女孩”。仅被 @ 时回复，尚未上线；采集与长期记忆默认关闭，需运行时配置并完成一次两步开启。
 version: 0.1.0
 astrbot_version: "==4.28.1"
 support_platforms:
