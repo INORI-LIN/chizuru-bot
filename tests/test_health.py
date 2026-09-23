@@ -272,6 +272,17 @@ class ReportTests(unittest.TestCase):
         # 抽取行仍在清理行之前，且计数为 0 时报告完全不变（既有末行断言依赖它）。
         self.assertLess(lines.index("抽取：成功 0 次，失败 0 次"), lines.index("清理失败：2 次（待维护者复跑清理命令）"))
 
+    def test_cleanup_failure_count_can_be_aligned_to_the_persisted_registry(self):
+        """S4-03：计数可被持久登记覆盖（启动恢复、成功清理后扣减），非法值拒绝。"""
+        monitor = HealthMonitor()
+        self.assertEqual(monitor.set_cleanup_failures(3), 3)
+        self.assertEqual(monitor.cleanup_failures(), 3)
+        self.assertEqual(monitor.set_cleanup_failures(0), 0)
+        for bad in (-1, True, 1.0, "1"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    monitor.set_cleanup_failures(bad)
+
     def test_cleanup_failure_count_must_be_a_count(self):
         with self.assertRaises(ValueError):
             HealthSnapshot(platform=health(), cleanup_failures=-1)

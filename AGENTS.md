@@ -25,18 +25,18 @@
 | S1 基础连接与严格 @ | `S1-01`—`S1-15` 的**离线部分**【已完成】；`S1-16` 阶段门【阻塞·在线/凭据】，**未通过** |
 | S2 群上下文 | `S2-01`—`S2-09` 的**离线部分**【已完成】；`S2-10` 门禁记录见附录 F，**结论为未通过** |
 | S3 授权记忆 | `S3-01/02/05—12` 与 **`S3-03`/`S3-04`** 的**离线部分**【已完成】（批次 3a—3f，判据映射见附录 G 与附录 H）；`S3-13` 不排期 |
-| S4 运行与验收 | **进行中（离线先行，批次 4a）**：`S4-01`/`S4-02` 的**离线部分**【已完成】（固定提示接线 + `model_prices` 价目表来源 + 队列/期限/去重不变量；判据映射见附录 I）；`S4-03`—`S4-07` 未开始/阻塞，`S4-08` 阶段门未通过 |
+| S4 运行与验收 | **进行中（离线先行，批次 4a + 4b）**：`S4-01`/`S4-02` 的**离线部分**【已完成】（固定提示接线 + `model_prices` 价目表来源 + 队列/期限/去重不变量；判据映射见附录 I）；`S4-03`/`S4-04` 的**离线部分**【已完成】（清理失败登记升 schema v3 并跨重启保留 + `check_audit.py` 结构审计；判据映射见附录 J）；`S4-05`—`S4-07` 未开始/阻塞，`S4-08` 阶段门未通过 |
 
 - **`S1-16` / `S2-10` / `S3-13` / `S4-08` 四个阶段门均未记录通过 → 不得宣称任何阶段完成**；
   也不得把“离线测试全绿”当作验收通过（docs/03 §10）。**S4 离线先行**的决定与边界见 docs/03 §9.7：
-  S4 不得宣称完成，真实 401/402/429、QQ 离线、真实计费与端到端验收（O-16/O-17 + O-01—O-15）仍在线。
+  S4 不得宣称完成，真实 401/402/429、QQ 离线、真实计费、真实删除与进程重启、日志/端口/宿主快照与端到端验收（O-16—O-20 + O-01—O-15）仍在线。
 - **生产默认关闭**：采集需维护者在运行时配置里填入允许群与维护者，并完成一次两步开启；
   记忆需**成员本人两步确认**（`记忆 开启` → `记忆 确认开启`；2026-09-23 起 `set_authorized` 有了唯一的合法生产入口），
   且自动抽取还需先配置预算金额。**不得手工写库充当验收证据**（R24）。
 - **下一步合法工作只有两类**：① 具备真实账号/测试群/DeepSeek 凭据后执行在线清单（附录 D.3 的 O-01—O-10 + 附录 F.3.2 的 O-11—O-15 + 附录 I.4 的 O-16—O-17）；
-  ② 在线证据齐备后推阶段门与 S4 剩余卡（`S1-16` → `S2-10` → `S3-13` → `S4-03`—`S4-08`）。
-  **S1/S2/S3 的离线面已全部收口，S4 的 4a（S4-01/S4-02 离线部分）已完成；离线侧暂无已授权的下一批任务卡**——
-  开工新批次（如 4b 的 S4-03/S4-04）需维护者再次授权与批次前决定。
+  ② 在线证据齐备后推阶段门与 S4 剩余卡（`S1-16` → `S2-10` → `S3-13` → `S4-05`—`S4-08`）。
+  **S1/S2/S3 的离线面已全部收口，S4 的 4a（S4-01/S4-02）与 4b（S4-03/S4-04）离线部分已完成；离线侧暂无已授权的下一批任务卡**——
+  开工新批次（如 4c 的 S4-05 人设评审，属【待审·在线】）需维护者再次授权与批次前决定。
 - **明令禁止的“捷径”**：为让抽取跑起来而填入预算金额（docs/03 §9.6）；手工写授权行（R24）；
   把插件加载进混有其他插件的在线实例（架构 §14.4）；为推进度弱化验收判据。
 
@@ -58,7 +58,7 @@ export ASTRBOT_BUILD_DASHBOARD=0   # 阻止上游构建钩子运行 npm
 ```
 
 ```sh
-# 全量离线核验：7 个核验脚本 + 全部单元测试（当前共 772 项单元测试）
+# 全量离线核验：8 个核验脚本 + 全部单元测试（当前共 789 项单元测试）
 bash scripts/s0/run_all.sh
 
 # 只跑全部单元测试
@@ -73,14 +73,14 @@ env -u VIRTUAL_ENV uv run --project "$PWD/.runtime/astrbot" --no-sync --offline 
 env -u VIRTUAL_ENV uv run --project "$PWD/.runtime/astrbot" --no-sync --offline \
     python -B -m unittest discover -s "$PWD/tests" -k test_extraction_stops_before_chat -v
 
-# 单个核验脚本（check_env / check_outbound / check_gating / check_collect / check_temp / check_history / check_single_call）
+# 单个核验脚本（check_env / check_outbound / check_gating / check_collect / check_temp / check_history / check_single_call / check_audit）
 env -u VIRTUAL_ENV uv run --project "$PWD/.runtime/astrbot" --no-sync --offline \
     python -B scripts/s0/check_gating.py
 ```
 
 `run_all.sh` 的顺序：`check_env`(S0-01) → `check_outbound`(S0-06) → `check_gating`(S0-02) →
 `check_collect`(S0-03) → `check_temp`(S0-04) → `check_history`(S0-05) → `check_single_call`(S1-10) →
-`unittest discover`。**“全绿” = 7 个脚本各自 exit 0（内部打印 `N/M PASS`）+ 772 项单测全部通过**；任一失败即非全绿。
+`check_audit`(S4-04) → `unittest discover`。**“全绿” = 8 个脚本各自 exit 0（内部打印 `N/M PASS`）+ 789 项单测全部通过**；任一失败即非全绿。
 
 环境与锁一致性（S0-01 判据，改动环境后必须复核）：
 
@@ -150,7 +150,7 @@ OneBot 事件 → main.py（唯一框架入口、薄适配，提取 MessageFacts
 | `send_gate.py` | 出站前复核：源范围 → 源触发形态 → 目标群一致 → 群开关 → 修订号 → 发送不确定；不一致即丢弃 | 不发送、不调模型、不做补救；**群开关与修订号由调用方注入**（无默认值）；不提供任何回执/送达 API；固定提示构造时即禁止模型调用 |
 | `redact.py` | 类别化日志记录（`AuditRecord` 无自由文本字段）、错误码闭集、每进程加盐的关联标识、保留期与大小策略、AstrBot/NapCat 日志审计清单 | 不做日志 IO、不轮转文件（`logging` 都不导入）；不记正文/请求体/密钥/推理文本；关联摘要不可还原、跨重启不可关联（刻意取舍） |
 | `context_buffer.py` | 普通群聊内存环形缓冲：30 条/10 分钟取严、惰性淘汰、无后台任务；形状/命令/敏感/自身/重复全部拒绝；`clear_group`/`clear_member`；条目附昵称（**仅展示**） | 不落盘、不请求模型、不发消息、不导入框架；**条数与 TTL 由调用方注入**；不采集未告知群；昵称不进键、不参与判定 |
-| `storage/*` | 插件 SQLite：`db`（延迟建库、短事务、失败不恢复）、`schema`（**五张** STRICT 表 + `user_version`，版本 2）、`groups`（群策略仓储，无行即关闭）、`members`（退出/加入 + 成员修订号）、`memories`（记忆授权、低敏事实、来源去重） | 不在事务内等网络；不存全量群聊；**两张 S2 表不存记忆授权**（授权只在 `memory_state`）；**上限与保留期不写默认值、由调用方注入**；路径由调用方注入（无默认值） |
+| `storage/*` | 插件 SQLite：`db`（延迟建库、短事务、失败不恢复）、`schema`（**六张** STRICT 表 + `user_version`，版本 3）、`groups`（群策略仓储，无行即关闭）、`members`（退出/加入 + 成员修订号）、`memories`（记忆授权、低敏事实、来源去重）、`maintenance`（清理失败的待维护登记，S4-03） | 不在事务内等网络；不存全量群聊；**两张 S2 表不存记忆授权**（授权只在 `memory_state`）；**上限与保留期不写默认值、由调用方注入**；路径由调用方注入（无默认值）；登记表只有计数与时间 |
 | `memory/*` | 授权记忆的候选层、管线与检索：`types.py`（四类白名单 `address`/`reply_length`/`interest`/`activity`、`prepare_source` 三道判定、`build_candidate` 校验）、`extract.py`（**待审**提示词 + 指纹、`parse_candidates` 只读两个键且不合格整批放弃）、`pipeline.py`（`admit` 五道准入与 `write_back` 单事务修订重核 + 来源去重）、`retrieve.py`（**只接受可信成员键**、注入块渲染、`category_label`）、`consent.py`（附录 C.2/C.3 定稿文案与版本常量、成员级两步确认窗口、版本谓词与群内回执/列表渲染） | 不导入框架/asyncio、不发送、不做预算预留与调度（属装配层）；**不含人设与群历史**；不递归触发聊天；**不读取模型给出的身份/授权字段**；所有准入拒绝都静默；`retrieve` 没有可传入他人 ID 的入口；`consent` 不落盘、不读配置、窗口键只能是 `MemberKey` |
 | `llm.py` | 请求成形（`LLMRequestPlan`，键集固定、无工具参数）、回复解释（只读 `role`/`completion_text`）、错误分类、≤1 次重试判定（共用同一 `Deadline`）、usage 映射、`FollowUp` 类别 | 不发送、不导入框架、不建网关/客户端；不组装人格与上下文；不读写历史与存储；**不读取推理字段、不追加工具**；不含任何群内文案；**在线部分未验证** |
 
@@ -160,21 +160,24 @@ docs/03 §3.2 的目录树是**拟议结构 + 【已实现】标注**的混合�
 
 ### 4.3 框架装配事实（已核验）
 
-- **唯一 handler**：`main.py:421-423`，`@filter.platform_adapter_type(AIOCQHTTP)` + `@filter.event_message_type(ALL, priority=1000)`；
-  收口三件套 `stop_event() + clear_result() + should_call_llm(True)` 在 `main.py:428-430`（K1/K5）。
-- **唯一出站**：`_deliver()`（`main.py:2036`），出站前必过 `send_gate.evaluate`，`event.send` 抛异常即 `SEND_UNCERTAIN` 且**不重发**（唯一 `event.send` 调用在 `main.py:2080`）。
-  三个包装出口：`_deliver_notice`（`main.py:1464`，告知全文）、`_deliver_memory`（`main.py:1901`，记忆类回执）、
-  `_deliver_fixed`（`main.py:1926`，**固定提示**，S4-01，固定 `FIXED_NOTICE + llm_invoked=False + revision=None`）。
+- **唯一 handler**：`main.py:427-429`，`@filter.platform_adapter_type(AIOCQHTTP)` + `@filter.event_message_type(ALL, priority=1000)`；
+  收口三件套 `stop_event() + clear_result() + should_call_llm(True)` 在 `main.py:434-436`（K1/K5）。
+- **唯一出站**：`_deliver()`（`main.py:2123`），出站前必过 `send_gate.evaluate`，`event.send` 抛异常即 `SEND_UNCERTAIN` 且**不重发**（唯一 `event.send` 调用在 `main.py:2167`）。
+  三个包装出口：`_deliver_notice`（`main.py:1470`，告知全文）、`_deliver_memory`（`main.py:1907`，记忆类回执）、
+  `_deliver_fixed`（`main.py:1932`，**固定提示**，S4-01，固定 `FIXED_NOTICE + llm_invoked=False + revision=None`）。
 - **群内用户可见输出穷举**：① `千鹤 状态`（既有报告 + 一行群上下文状态 + 金额已配置时的价目表行）；② `群上下文 开启` 与确认失败时的重发全文（附录 C.1 逐字）；
   ③ `记忆 开启` 与确认失败时的重发全文（附录 C.2 逐字）、`记忆 查看` 的提示（附录 C.3 逐字）与确认后的列表、其余记忆命令的回执；
   ④ `@` 后的模型聊天回复；⑤ **固定提示**（附录 C.5 逐字）：附件能力、超预算、失败、空回复、忙碌、暂不可用。
   **静默无回执**：`上下文 退出/加入`、`群上下文 关闭`、`上下文 清空`、`千鹤 暂停/恢复`（执行状态变更）；
   未分类的故障与修订变化导致的在途丢弃也静默。**不执行只记审计**：`帮助`。
+- **清理失败跨重启可见**（S4-03，R23）：群级删除失败的次数与时间落在 `storage.maintenance`（`cleanup_failure` 表，schema v3），
+  启动读回计数与 `DELETION_FAILED`（记忆相关能力保持停用），`千鹤 状态` 的「清理失败：N 次」行因此不随重启消失；
+  一次**成功**的重跑（`上下文 清空`/`群上下文 关闭`/`上下文 退出`）按该群登记数扣减，最后一条清除时才解除降级。
 - **注入机制**：动态材料与记忆块经 `extra_user_content_parts`（逐个 `mark_as_temp()`）、历史经 `contexts`，
   两者都不进 system 且受同一 8192 预算裁剪；`_no_save` 另行处理整轮排除（K6）。
 - **配置生效时机**：`limits`、`budget`（含**价目表 `model_prices`**，S4-01）与两个记忆确认窗口（取 `memory.auth_confirm_ttl_seconds`）在 `initialize()` 时固定
   （运行时改动需重载插件）；身份、允许群、维护者映射与金额开关**每个事件重读**。
-- **测试注入点**（`main.py:263-274`）：`clock` / `datetime_clock` / `redactor_salt` / `storage_path` /
+- **测试注入点**（`main.py:268-279`）：`clock` / `datetime_clock` / `redactor_salt` / `storage_path` /
   `history_cleaner` / `history_store` / `price_table`——`price_table` 注入时优先于配置；生产由 `model_prices` 构造，未配置即空价目表（R20）。
 
 ### 4.4 不可违背的硬约束
@@ -229,7 +232,7 @@ docs/03 §3.2 的目录树是**拟议结构 + 【已实现】标注**的混合�
 | `CONSENT_VERSION` / `CONSENT_TEXT` | `consent-1` / 附录 C.2 逐字（2026-09-23 定稿） | `memory/consent.py` | SHA-256 `c8262dee04ae00bde436cd7533b941e1a3446b3be33c6cb017dded2a8ce706ff`（`tests/test_memory_consent.py`） |
 | `VIEW_NOTICE_VERSION` / `VIEW_NOTICE_TEXT` | `memory-view-1` / 附录 C.3 逐字（同上定稿） | `memory/consent.py` | SHA-256 `93bb8a55d1a45c0d26ce28b0ee8ddcb8c1347a62f3d60e7ed6756609dad2d189`（同上） |
 | `FIXED_NOTICE_VERSION` / 六条固定提示 | `fixed-notice-1` / 附录 C.5 逐字（2026-09-23 定稿） | `fixed_notice.py` | 规范串（按常量名升序 `名称=文本` 以换行连接）SHA-256 `ca30978801c72731ef479b615f1ab2a85788a4337a08e3c63aa87756034af8e4`（`tests/test_fixed_notice.py`） |
-| `SCHEMA_VERSION` | `2`（五张 STRICT 表） | `storage/schema.py:22` | 升版用例（`tests/test_storage_db.py`） |
+| `SCHEMA_VERSION` | `3`（六张 STRICT 表） | `storage/schema.py:25` | 升版用例（`tests/test_storage_db.py`，含 v2 → v3） |
 
 改动流程：① 递增版本字面量（如 `persona-2`）；② 同步测试内 SHA-256/字面量；③ 在 docs/03 记录理由——
 三者缺一不可。附录 C.1/C.2/C.3 均已定稿：`NOTICE_TEXT` 不得再改字（改了必须重新告知）；
@@ -244,6 +247,7 @@ docs/03 §3.2 的目录树是**拟议结构 + 【已实现】标注**的混合�
   `MATERIAL_TITLE`；类别名已随 3f 按需求 §4.3 原文定稿（群内列表与注入块共用同一份）。
 - **维护者可见新文案**：`notice.describe_policy`（`notice.py:170`）、`main._describe_group`（`main.py:1130` 附近）、
   `health.py` 的清理失败行与**价目表片段**（`health.py` 的 `format_report`，随批次 4a 组装但**标记待评审**）。
+  （`check_audit.py` 的 `AuditRecord` 字段闭集与 `AUDIT_CHECKLIST` 输出属**核验脚本**，不面向群成员。）
 - **建议参数（值已写死但标注“待评审”，改动需在 docs/03 记录理由）**：去重窗口 600s / 容量 2048
   （绑仍未在线核验的 O-07）、昵称 24 字、行开销 8 token、相对时间 12h、缓冲 300 字 / 8 关键词、
   日志 20 MiB、busy timeout 5s、`EXTRACTION_STOP_RATIO=0.9`、中文 2 token 估算。
@@ -278,7 +282,7 @@ docs/03 §3.2 的目录树是**拟议结构 + 【已实现】标注**的混合�
 
 - 测试用标准库 `unittest`，无 pytest/conftest。**必须在仓库根目录运行**：测试以顶层包名
   `astrbot_plugin_chizuru.*` 导入模块，靠 `python -m` 把 CWD 放进 `sys.path`。
-- 规模：**28 个测试模块、772 项用例**；`tests/fakes.py` 不是测试模块（不匹配 `test*.py`），
+- 规模：**29 个测试模块、789 项用例**；`tests/fakes.py` 不是测试模块（不匹配 `test*.py`），
   也不要 import `scripts/s0/`。
 - `tests/test_plugin.py` 使用**真实** AstrBot 框架对象（导入 AstrBot、解析 `metadata.yaml`、
   注入 `_conf_schema.json`、经 `call_handler` 复刻 `star_request.py` 的处理器调用循环）；
@@ -319,7 +323,7 @@ docs/03 §3.2 的目录树是**拟议结构 + 【已实现】标注**的混合�
 | `main.py` 的 `_deliver` 内 `GateFacts.previous=None` | `DropReason.SEND_UNCERTAIN` 分支在生产装配中不可达——去重层已在入口拦截重放；**批次 4a 复核后确认不改**（开启它需要跨事件保存发送结论，属新的状态设计） |
 | `llm.py:377-401` | ~~`FollowUp` / `follow_up()` 无任何生产调用~~ **2026-09-23（批次 4a）已接线**：`main._handle_chat` 用 `follow_up` 判定该不该给固定提示；`background=True 恒 NOTHING` 仍是单元级护栏 |
 | `redact.py:75` | `EventCategory.DEGRADATION` 全仓库零引用（`health.py` 的 `_DEGRADATION_TEXT` 是另一物） |
-| `budget.py`、`redact.py`、`notice.py` | `settle(cost=…)`、`RetentionPolicy`、`AUDIT_CHECKLIST`、`NoticeGate.stats` 等公开 API 未接线，供测试与包内复用 |
+| `budget.py`、`redact.py`、`notice.py` | `settle(cost=…)`、`NoticeGate.stats` 等公开 API 未接线，供测试与包内复用；`AUDIT_CHECKLIST` 自批次 4b 起由 `scripts/s0/check_audit.py` 输出（框架侧人工审计清单），`RetentionPolicy` 仍只被测试消费 |
 
 以下不一致**结论为误判，不要据此改代码**：曾怀疑 `main.py:37` 的裁剪顺序注释与 `context_assembly.trim_to_budget`
 相反——复核后二者一致（`context_assembly.py:320-359` 先分配记忆块，语义正是“先丢材料、再丢记忆行、最后丢历史”）。
@@ -345,3 +349,14 @@ docs/03 §3.2 的目录树是**拟议结构 + 【已实现】标注**的混合�
 4. `scripts/s0/check_gating.py` 补了一句覆盖范围说明（该矩阵**不调用插件的 `initialize()`**，
    插件侧出站由 `tests/test_plugin.py` / `tests/test_assembly.py` 覆盖），**判据一字未改**；
    `scripts/s0/run_all.sh` 的汇总结论新增 S4 一行。
+
+### 9.5 批次 4b 落地后的回写（2026-09-23）
+
+1. `storage/schema.py` 升到 **SCHEMA_VERSION=3**（新增 `cleanup_failure`）并新增 `storage/maintenance.py`；
+   装配层接线"失败写登记 / 启动恢复 / 成功重跑扣减"（S4-03，闭合 R23）；`main.py` 行号再次下移，本文件已同步
+   （唯一 handler `:427-429`、收口 `:434-436`、`_deliver` `:2123`、`event.send` `:2167`、测试注入点 `:268-279`）。
+2. 新增 `scripts/s0/check_audit.py`（S4-04 的 8 项离线结构审计）并接入 `run_all.sh`：**核验脚本 7 → 8**，
+   本文件与 README 的"全绿"定义、脚本清单、测试规模（**29 模块 / 789 项**）同步。
+3. `docs/03` 升至 0.27：任务卡状态（S4-03/S4-04 离线部分）、§5.2 的 D27—D32、§9.8（4b 授权决定）、
+   §8 的 R23 状态与新增 **R29**、**附录 J**（含在线编号 **O-18—O-20**）；`docs/02` 升至 0.14 并新增 §14.9。
+4. `AUDIT_CHECKLIST` 自本批起由 `check_audit.py` 输出（§9.2 已回写）；`RetentionPolicy`、`NoticeGate.stats` 等其余未接线 API 状态不变。

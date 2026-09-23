@@ -237,11 +237,22 @@ class HealthMonitor:
     def record_cleanup_failure(self) -> int:
         """记一次"清理未能确认完成"（S2-08 的待维护错误登记），返回累计值。
 
-        **只增不清**：一次失败过的删除在重启前都算未恢复；重启会让计数与
-        `DELETION_FAILED` 一起归零，这是已知限制（docs/03 §5.2、R23）。
+        **只增不清**：一次失败过的删除在维护者重跑清理并成功之前都算未恢复
+        （S4-03 起该计数由持久登记承载，跨重启保留，见 ``set_cleanup_failures``）。
         """
         self._cleanup_failures += 1
         return self._cleanup_failures
+
+    def set_cleanup_failures(self, count: int) -> int:
+        """把清理失败计数**对齐到持久登记**（启动时恢复、成功清理后重算）。
+
+        这不是"清零"入口：值只能来自待维护登记本身——清除的唯一途径是一次成功的
+        重跑（架构 §8.3"恢复前不重启相关能力"）。
+        """
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError("count 必须是非负整数")
+        self._cleanup_failures = count
+        return count
 
     def cleanup_failures(self) -> int:
         return self._cleanup_failures

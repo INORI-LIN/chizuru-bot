@@ -1,25 +1,28 @@
 """SQLite 结构定义与版本。
 
-五张表分属两个阶段：S2 的 ``group_policy`` / ``member_state``（群策略与成员上下文），
+六张表分属三个阶段：S2 的 ``group_policy`` / ``member_state``（群策略与成员上下文），
 S3 的 ``memory_state`` / ``memory_fact`` / ``memory_source``（记忆授权、低敏事实、
-来源去重）。**两张 S2 表仍然没有"记忆授权"列**——记忆授权只在 ``memory_state``
-里，"退出普通群上下文不改动记忆授权"因此仍是表结构的事实，而不是实现纪律。
+来源去重），S4-03 的 ``cleanup_failure``（清理未能确认完成的**待维护错误登记**，
+跨重启保留以便闭合 R23）。**两张 S2 表仍然没有"记忆授权"列**——记忆授权只在
+``memory_state`` 里，"退出普通群上下文不改动记忆授权"因此仍是表结构的事实，
+而不是实现纪律。``cleanup_failure`` 同样只有计数与时间，没有正文、路径或错误文本。
 
 "无有效行默认关闭"同样落在结构上：本模块不插入任何默认行，行只在真实动作
-（告知确认、暂停、成员退出、成员授权、抽取写回）发生时创建。
+（告知确认、暂停、成员退出、成员授权、抽取写回、清理失败）发生时创建。
 
-**结构版本 2 的迁移口径**：``ensure_schema`` 一直是幂等的 ``IF NOT EXISTS`` 建表加写
-版本，因此老库（v1）在**首次写入**时自动补齐三张新表并升到 2，既有行原样保留，不需要
-显式的迁移分支。代价写在明处：首次写入之前 ``Database.read`` 按"未初始化"处理
-（``db._is_initialized`` 只在版本相等时为真），群策略与成员状态因此短暂回到"无状态"
-——采集关闭、暂停视为未暂停、聊天照常。这是 fail-closed，不是数据丢失。
+**结构版本的迁移口径**：``ensure_schema`` 一直是幂等的 ``IF NOT EXISTS`` 建表加写
+版本，因此老库（v1 或 v2）在**首次写入**时自动补齐缺的表并升到当前版本，既有行原样
+保留，不需要显式的迁移分支。代价写在明处：首次写入之前 ``Database.read`` 按"未初始化"
+处理（``db._is_initialized`` 只在版本相等时为真），群策略与成员状态因此短暂回到"无状态"
+——采集关闭、暂停视为未暂停、聊天照常；已登记的清理失败在首次写入前读不到，计数从 0
+起步（不虚报，也不误报）。这是 fail-closed，不是数据丢失。
 """
 
 from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 """结构版本（``PRAGMA user_version``）。比它新的库一律拒绝（``db.StorageFailure``）。"""
 
 CREATE_GROUP_POLICY = """
@@ -98,12 +101,25 @@ CREATE TABLE IF NOT EXISTS memory_source (
 ) STRICT
 """
 
+CREATE_CLEANUP_FAILURE = """
+CREATE TABLE IF NOT EXISTS cleanup_failure (
+    platform_id  TEXT    NOT NULL,
+    self_id      TEXT    NOT NULL,
+    group_id     TEXT    NOT NULL,
+    failures     INTEGER NOT NULL CHECK (failures >= 1),
+    first_at     INTEGER NOT NULL,
+    last_at      INTEGER NOT NULL,
+    PRIMARY KEY (platform_id, self_id, group_id)
+) STRICT
+"""
+
 _TABLES = (
     CREATE_GROUP_POLICY,
     CREATE_MEMBER_STATE,
     CREATE_MEMORY_STATE,
     CREATE_MEMORY_FACT,
     CREATE_MEMORY_SOURCE,
+    CREATE_CLEANUP_FAILURE,
 )
 
 

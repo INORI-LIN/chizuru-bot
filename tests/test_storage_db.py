@@ -19,8 +19,9 @@ EXPECTED_TABLES = {
     "memory_state",
     "memory_fact",
     "memory_source",
+    "cleanup_failure",
 }
-"""结构版本 2 的**完整**表集合；精确相等（而不是包含），多一张少一张都要改这里。"""
+"""结构版本 3 的**完整**表集合；精确相等（而不是包含），多一张少一张都要改这里。"""
 
 _VERSION_1_GROUP_POLICY = """
 CREATE TABLE group_policy (
@@ -129,6 +130,42 @@ class MigrationTests(StorageDbTestCase):
 
     def test_first_write_adds_the_new_tables_and_keeps_the_old_rows(self):
         self.make_version_1_database()
+        with self.database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO member_state (platform_id, self_id, group_id, member_id, updated_at) "
+                "VALUES ('qq-local', '10001', '20001', '30001', 1)"
+            )
+        self.assertEqual(self.table_names(), EXPECTED_TABLES)
+        with self.database.read() as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            policy = connection.execute(
+                "SELECT revision, context_enabled FROM group_policy WHERE group_id = '20001'"
+            ).fetchone()
+        self.assertEqual(version, schema.SCHEMA_VERSION)
+        self.assertEqual((policy["revision"], policy["context_enabled"]), (7, 1))
+
+    def make_version_2_database(self) -> None:
+        """造一个结构版本 2 的库：当前结构建库后删掉 v3 新增的表并回写版本 2。
+
+        v2 与 v3 的差别只有 ``cleanup_failure`` 一张表，因此"删掉它再回写版本 2"与
+        真实的 v2 老库形状等价；用真实 DDL 而不是冻结副本可以避免第二个 DDL 副本漂移。
+        """
+        with self.database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO group_policy (platform_id, self_id, group_id, context_enabled, "
+                "notice_version, revision, updated_at) VALUES ('qq-local', '10001', '20001', 1, "
+                "'notice-1', 7, 1)"
+            )
+            connection.execute("DROP TABLE cleanup_failure")
+            connection.execute("PRAGMA user_version = 2")
+
+    def test_version_2_gains_the_registry_on_the_first_write_and_keeps_the_rows(self):
+        self.make_version_2_database()
+        # 版本不等 → 首次写入前按"未初始化"处理：清理失败的登记暂时读不到（不虚报也不误报）。
+        self.database.probe()
+        with self.database.read() as connection:
+            self.assertIsNone(connection)
+
         with self.database.transaction() as connection:
             connection.execute(
                 "INSERT INTO member_state (platform_id, self_id, group_id, member_id, updated_at) "

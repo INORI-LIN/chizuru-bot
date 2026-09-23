@@ -163,7 +163,16 @@ class StructuralTests(MemberStoreTestCase):
                 for row in connection.execute("PRAGMA table_info(group_policy)")
             }
         self.assertEqual(
-            tables, {"group_policy", "member_state", "memory_state", "memory_fact", "memory_source"}
+            tables,
+            {
+                "group_policy",
+                "member_state",
+                "memory_state",
+                "memory_fact",
+                "memory_source",
+                # S4-03 的待维护错误登记：同样没有任何成员内容列。
+                "cleanup_failure",
+            },
         )
         # 记忆授权只在 memory_state 里：这两张 S2 表仍然没有任何授权列。
         forbidden = {"memory", "authorized", "grant", "consent", "allowed"}

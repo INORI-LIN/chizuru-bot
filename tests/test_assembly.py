@@ -2483,5 +2483,137 @@ class MemoryConsentCommandTests(AssemblyTestCase):
         self.assertEqual([fact.content for fact in self.memory_facts()], ["看番"])
 
 
+class MaintenanceRegistryTests(AssemblyTestCase):
+    """S4-03：清理失败的待维护登记跨重启保留（闭合 R23），成功重跑后恢复。"""
+
+    async def start_with_storage(self, *, provider=None, cleaner=None, config=None):
+        await self.start(
+            provider=provider or fakes.FakeProvider(),
+            storage_path=self.storage_path,
+            history_cleaner=cleaner if cleaner is not None else fakes.FakeHistoryCleaner(),
+            config=config,
+        )
+
+    def pending_cleanup_failures(self) -> int:
+        return self.plugin.services.health.cleanup_failures()
+
+    async def test_failed_cleanup_survives_restart_and_stays_visible(self):
+        self.storage_path = self.new_storage_path()
+        await self.start_with_storage(
+            cleaner=fakes.FakeHistoryCleaner(error=RuntimeError("delete failed"))
+        )
+        self.open_group()
+        await self.plugin.on_message(self.mention("上下文 清空", message_id="clear-1"))
+        self.assertEqual(self.pending_cleanup_failures(), 1)
+
+        # 模拟重启：同一 storage 路径、清理器恢复正常。
+        await self.plugin.terminate()
+        await self.start_with_storage()
+        # R23 的核心：重启不再把登记与降级一起归零。
+        self.assertEqual(self.pending_cleanup_failures(), 1)
+        self.assertIn(
+            plugin_module.health.Degradation.DELETION_FAILED,
+            self.plugin.services.health.degradations(),
+        )
+        await self.plugin.on_message(self.mention("千鹤 状态", message_id="status-1"))
+        self.assertIn("清理失败：1 次（待维护者复跑清理命令）", text_of(self.sent[0]))
+
+        # 记忆相关能力保持关闭（架构 §8.3"恢复前不重启相关能力"）。
+        await self.plugin.on_message(self.plain("登记未清除时的话", message_id="after-1"))
+        self.assertEqual(self.collected(), ())
+
+    async def test_successful_rerun_clears_the_registry_and_resumes_collection(self):
+        self.storage_path = self.new_storage_path()
+        await self.start_with_storage(
+            cleaner=fakes.FakeHistoryCleaner(error=RuntimeError("delete failed"))
+        )
+        self.open_group()
+        await self.plugin.on_message(self.mention("上下文 清空", message_id="clear-1"))
+        await self.plugin.terminate()
+
+        await self.start_with_storage()
+        await self.plugin.on_message(self.mention("上下文 清空", message_id="clear-2"))
+
+        self.assertEqual(self.pending_cleanup_failures(), 0)
+        self.assertNotIn(
+            plugin_module.health.Degradation.DELETION_FAILED,
+            self.plugin.services.health.degradations(),
+        )
+        await self.plugin.on_message(self.mention("千鹤 状态", message_id="status-1"))
+        self.assertNotIn("清理失败", text_of(self.sent[0]))
+        await self.plugin.on_message(self.plain("恢复后的话", message_id="after-1"))
+        self.assertEqual([entry.text for entry in self.collected()], ["恢复后的话"])
+
+    async def test_only_the_recovered_group_is_subtracted(self):
+        """只要还有别的群未确认恢复，降级与"保持关闭"都不解除。"""
+        self.storage_path = self.new_storage_path()
+        config = make_config(
+            allowed_group_ids=["20001", "20002"],
+            group_maintainers={"20001": ["30001"], "20002": ["30001"]},
+        )
+        await self.start_with_storage(
+            config=config,
+            cleaner=fakes.FakeHistoryCleaner(error=RuntimeError("delete failed")),
+        )
+        self.open_group(group_id="20001")
+        self.open_group(group_id="20002")
+        await self.plugin.on_message(
+            self.mention("上下文 清空", group_id="20001", message_id="clear-a")
+        )
+        await self.plugin.on_message(
+            self.mention("上下文 清空", group_id="20002", message_id="clear-b")
+        )
+        self.assertEqual(self.pending_cleanup_failures(), 2)
+
+        # 乙群重跑成功：只扣掉乙群的登记，降级仍在（甲群还没恢复）。
+        await self.plugin.terminate()
+        await self.start_with_storage(config=config)
+        await self.plugin.on_message(
+            self.mention("上下文 清空", group_id="20002", message_id="clear-c")
+        )
+        self.assertEqual(self.pending_cleanup_failures(), 1)
+        self.assertIn(
+            plugin_module.health.Degradation.DELETION_FAILED,
+            self.plugin.services.health.degradations(),
+        )
+
+        # 甲群也恢复后，登记清零、降级解除。
+        await self.plugin.on_message(
+            self.mention("上下文 清空", group_id="20001", message_id="clear-d")
+        )
+        self.assertEqual(self.pending_cleanup_failures(), 0)
+        self.assertNotIn(
+            plugin_module.health.Degradation.DELETION_FAILED,
+            self.plugin.services.health.degradations(),
+        )
+
+    async def test_deleted_memory_does_not_revive_after_restart(self):
+        """端到端删除（含重启）：单条删除在**重新打开库文件**后仍不复活。"""
+        self.storage_path = self.new_storage_path()
+        await self.start_with_storage()
+        self.open_group()
+        self.authorize_memory()
+        self.seed_fact(category="address", content="叫我小林", source="seed-1")
+        self.seed_fact(category="interest", content="喜欢甜食", source="seed-2")
+        await self.plugin.on_message(self.mention("记忆 删除 1", message_id="del-1"))
+        self.assertEqual([fact.content for fact in self.memory_facts()], ["喜欢甜食"])
+
+        await self.plugin.terminate()
+        await self.start_with_storage()
+        contents = [fact.content for fact in self.memory_facts()]
+        self.assertEqual(contents, ["喜欢甜食"])
+
+    async def test_history_cleanup_without_a_platform_segment_is_not_a_success(self):
+        """深防御：空 umo 无法确认平台消息历史已清理，不得被当成"已清理"（K15 相关）。"""
+        self.storage_path = self.new_storage_path()
+        await self.start(
+            provider=fakes.FakeProvider(),
+            storage_path=self.storage_path,
+            conversation_manager=fakes.FakeConversationManager(),
+        )
+        with self.assertRaises(ValueError):
+            await self.plugin._delete_group_history("")
+
+
 if __name__ == "__main__":
     unittest.main()

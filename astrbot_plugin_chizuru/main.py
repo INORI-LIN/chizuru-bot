@@ -43,6 +43,11 @@
   （`memory_assisted`），因此注入的记忆不会永久混进群历史。
 - 互动历史写回只在**送达成功**后进行，且写前重读群/成员修订号；写失败只记审计，
   不影响已送达的回复、不置持久降级（历史不是聊天的前置条件）。
+- **清理失败跨重启保留**（S4-03，闭合 R23）：群级删除（`上下文 退出`、`上下文 清空`、
+  `群上下文 关闭`）失败时把"未确认恢复"的计数写入 `storage.maintenance`，启动时读回
+  计数与 `DELETION_FAILED`；一次**成功**的重跑清除该群登记，最后一条被清除时解除降级
+  （架构 §8.3"恢复前不重启相关能力"）。启动裁剪的失败只计本次运行、不落登记——它在
+  每次启动自动重跑，没有"待维护者复跑"的状态。无存储时只保留本次运行的计数，不假装恢复。
 - 群维护者命令（S2-02/S2-05）已接线：`群上下文 开启` 逐字回复附录 C.1 全文并记录
   5 分钟待确认窗口，`群上下文 确认开启` 在窗口内同群同人时写入告知版本并开启采集
   （失败重发全文并重开窗口）；`群上下文 关闭` / `上下文 清空` / `千鹤 暂停/恢复`
@@ -312,6 +317,7 @@ class ChizuruPlugin(Star):
                 window_seconds=settings.memory.auth_confirm_ttl_seconds,
             ),
         )
+        self._restore_cleanup_failures(services=self.services)
         await self._sweep_history(settings)
 
     async def _sweep_history(self, settings: Settings) -> None:
@@ -335,12 +341,12 @@ class ChizuruPlugin(Star):
         try:
             changed, failed = await sweep(settings.platform_id, self._trim_plan(settings))
         except Exception:
-            self._record_cleanup_failure(services)
+            self._record_sweep_failure(services)
             return
         if changed:
             self._audit(services, redact.EventCategory.CONTEXT_OP, count=changed)
         if failed:
-            self._record_cleanup_failure(services, count=failed)
+            self._record_sweep_failure(services, count=failed)
 
     def _trim_plan(self, settings: Settings) -> Callable[[str | None], tuple[dict, ...] | None]:
         """把窗口参数固定成纯策略交给存储适配器；时钟在启动时刻取一次。"""
@@ -1337,7 +1343,7 @@ class ChizuruPlugin(Star):
             if intent.kind is commands.CommandKind.CONTEXT_LEAVE:
                 stored.members.opt_out(member)
                 services.context_buffer.clear_member(member)
-                await self._clear_group_history(event, services)
+                await self._clear_group_history(event, services, group)
             else:
                 stored.members.opt_in(
                     member,
@@ -1534,7 +1540,7 @@ class ChizuruPlugin(Star):
                     code=redact.ErrorCode.MEMORY_STORE_FAILED,
                 )
             services.context_buffer.clear_group(group)
-            await self._clear_group_history(event, services)
+            await self._clear_group_history(event, services, group)
             self._audit(services, redact.EventCategory.CONTEXT_OP)
             services.dedup.finish(key, Outcome.COMPLETED)
             return
@@ -1552,7 +1558,7 @@ class ChizuruPlugin(Star):
                     required_notice_version=settings.notice_version,
                 )
                 services.context_buffer.clear_group(group)
-                await self._clear_group_history(event, services)
+                await self._clear_group_history(event, services, group)
             elif intent.kind is commands.CommandKind.PAUSE:
                 self._set_paused(stored, group, paused=True)
                 services.context_buffer.clear_group(group)
@@ -1995,17 +2001,78 @@ class ChizuruPlugin(Star):
             code=redact.ErrorCode.MEMORY_STORE_FAILED,
         )
 
-    async def _clear_group_history(self, event: AstrMessageEvent, services: _Services) -> None:
-        """清理该群互动历史；失败只登记降级与计数，不重试、不虚报（重试属 S2-08 的结论：不重试）。"""
+    async def _clear_group_history(
+        self,
+        event: AstrMessageEvent,
+        services: _Services,
+        group: GroupKey,
+    ) -> None:
+        """清理该群互动历史；失败只登记降级与计数（含持久登记），不重试、不虚报。
+
+        成功则把该群从**待维护登记**里移除：这是"已恢复"的唯一来源（S4-03/R23）。
+        """
         cleaner = self.history_cleaner or self._delete_group_history
         try:
             await cleaner(event.unified_msg_origin)
         except Exception:
             services.health.set_degraded(health.Degradation.DELETION_FAILED)
-            self._record_cleanup_failure(services)
+            self._record_cleanup_failure(services, group)
+            return
+        self._clear_cleanup_failure(services, group)
 
-    def _record_cleanup_failure(self, services: _Services, *, count: int = 1) -> None:
-        """登记一次"清理未能确认完成"（S2-08）：只增计数 + 留审计，不发群消息。"""
+    def _record_cleanup_failure(self, services: _Services, group: GroupKey, *, count: int = 1) -> None:
+        """登记一次"清理未能确认完成"（S2-08 + S4-03）：内存计数、持久登记、审计。
+
+        持久登记写失败**不虚报**：审计码改为存储失败，本次运行的计数仍然保留；
+        存储的粘滞失败会同时让记忆相关能力保持关闭（`_memory_store`）。
+        """
+        services.health.record_cleanup_failure()
+        code = redact.ErrorCode.DELETE_FAILED
+        stored = services.storage
+        if stored is not None and not stored.database.failed:
+            try:
+                stored.maintenance.record_failure(group)
+            except storage.StorageFailure:
+                code = redact.ErrorCode.MEMORY_STORE_FAILED
+        self._audit(
+            services,
+            redact.EventCategory.CLEANUP_FAILURE,
+            code=code,
+            count=count,
+        )
+
+    def _clear_cleanup_failure(self, services: _Services, group: GroupKey) -> None:
+        """一次**成功**的群级清理后撤销该群登记，并在全部清空后解除 `DELETION_FAILED`。
+
+        计数按该群**登记在案的失败次数**扣减（不粗暴清零：启动裁剪等其他失败仍留在
+        本次运行的计数里）。解除降级挂在"最后一条登记被清除"上：只要还有别的群删除
+        未确认完成，降级与"记忆相关能力保持关闭"都不恢复（架构 §8.3）。无存储时不做
+        任何声明——计数保持原值，不假装恢复。
+        """
+        stored = services.storage
+        if stored is None or stored.database.failed:
+            return
+        try:
+            pending = stored.maintenance.failures(group)
+            if not pending.exists:
+                return
+            if not stored.maintenance.clear_group(group):
+                return
+            remaining_total = stored.maintenance.total()
+        except storage.StorageFailure:
+            return
+        services.health.set_cleanup_failures(
+            max(0, services.health.cleanup_failures() - pending.failures)
+        )
+        if remaining_total == 0:
+            services.health.clear_degraded(health.Degradation.DELETION_FAILED)
+
+    def _record_sweep_failure(self, services: _Services, *, count: int = 1) -> None:
+        """启动裁剪失败：只计本次运行 + 审计，**不落持久登记**。
+
+        启动裁剪在每次启动都会自动重跑，没有"待维护者复跑"的状态；R23 的登记面是
+        群级删除（维护者能主动重跑的那些）。计数因此不跨重启保留，这是有意的。
+        """
         services.health.record_cleanup_failure()
         self._audit(
             services,
@@ -2013,6 +2080,26 @@ class ChizuruPlugin(Star):
             code=redact.ErrorCode.DELETE_FAILED,
             count=count,
         )
+
+    def _restore_cleanup_failures(self, services: _Services) -> int:
+        """启动时把持久登记读回计数与降级标志（S4-03 闭合 R23）。
+
+        有未恢复的登记 → 计数与 `DELETION_FAILED` 一起恢复：记忆相关能力继续停用，
+        `千鹤 状态` 继续显示"清理失败：N 次"，直到维护者重跑清理命令成功。
+        无存储、库失败或读取失败 → 保持零、不置降级（R21：存储不是前置条件）。
+        """
+        stored = services.storage
+        if stored is None or stored.database.failed:
+            return 0
+        try:
+            total = stored.maintenance.total()
+        except storage.StorageFailure:
+            return 0
+        if not total:
+            return 0
+        services.health.set_cleanup_failures(total)
+        services.health.set_degraded(health.Degradation.DELETION_FAILED)
+        return total
 
     async def _delete_group_history(self, umo: str) -> None:
         """原生历史清理（K9/R14 + S2-08）：**会话历史 + 平台消息历史**两步都做。
