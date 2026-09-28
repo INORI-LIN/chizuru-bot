@@ -1,6 +1,6 @@
 # 千鹤 QQ 群聊天机器人：实施拆分与任务卡
 
-- 文档版本：0.29
+- 文档版本：0.30
 - 日期：2026-09-28
 - 阶段：实施拆分（规划产物；落地进度见 §5.2 与文首版本记录）
 - 需求依据：[需求拆分](./01-requirements.md)
@@ -39,6 +39,7 @@
 | 0.27 | 2026-09-23 | **S4-03/S4-04 完成（离线部分，批次 4b）**：维护者授权 4b 并批准三项决定（R23 升 schema v3、S4-04 走核验脚本 + 附录 J、不在开发机执行宿主检查）。`storage/schema.py` 升到 **SCHEMA_VERSION=3** 并新增 `cleanup_failure` 表（只有计数与时间）；新增 `storage/maintenance.py`（登记/读取/按群清除，**无登记时不写库**）；`main.py` 接线：群级删除失败写持久登记、启动读回计数与 `DELETION_FAILED`、一次**成功**的重跑按该群登记数扣减并在最后一条清除时解除降级；启动裁剪失败仍只计本次运行（不落登记）。新增 `scripts/s0/check_audit.py`（S4-04 的离线结构审计，8 项判据：无网络原语/无文件写入与 logging/日志点只在 `_audit`/`AuditRecord` 字段闭集/无备份脚本/运行数据被 .gitignore 覆盖/配置无密钥类字段/无密钥样式字面量）并接入 `run_all.sh`（7 → **8 个核验脚本**）。测试 772 → **789 项**（`test_storage_maintenance.py` 10、`test_storage_db.py` +1 迁移、`test_health.py` +1、`test_assembly.py` 的 `MaintenanceRegistryTests` 5）；`run_all.sh` 八脚本全绿（10/15/12/7/8/11/24/8）。**行为分化**：两处表集合断言加入`cleanup_failure`（精确集合不变、只增一项），未放宽任何既有断言。新增风险 **R29**（v2 老库首次写入前读不到旧登记）与**附录 J**（S4-03/S4-04 离线判据 × 用例/清单映射，含在线编号 **O-18—O-20**）；**S4 仍不得宣称完成** |
 | 0.28 | 2026-09-28 | **S4-01 粘滞门禁 + `帮助` 回执（离线部分，批次 4c-离线＝S4 离线先行第三批）**：维护者授权两项一起做，并批准两项决定（粘滞解除条件 = **仅进程重启/插件重载**；`帮助` 文案照草案原文定稿）。`main.py` 新增 `_PAYMENT_ENTRIES`/`_payment_reason`/`_payment_block`/`_mark_payment_degraded`：401/402 首次出现即置 `PROVIDER_DISABLED`/`BUDGET_EXHAUSTED`，聊天在**暂停检查之后、装配之前**被门禁拦下（回一次暂不可用提示、`finish` 不 `release`），抽取早退同样受门禁约束；`_acquire_provider` 的"取到即清除"删除——**行为分化**：提供商"后配置好"不再自动恢复、需重载（既有用例改写，D38）。新增纯逻辑模块 `help_notice.py`（`help-notice-1` + 逐字全文，**附录 C.6**）与 `main._handle_help`（`FIXED_NOTICE` 出站、零模型调用、不写历史、暂停可达）；**新增任务卡 S1-17**。`EventCategory.DEGRADATION` 首次被生产引用（首次置位写一条审计）。测试 789 → **803 项**（`test_help_notice.py` 6、`test_assembly.py` 的 `StickyPaymentGateTests` 4 与 `HelpCommandTests` 4，改写 2 处既有用例）；`run_all.sh` 八脚本全绿（10/15/12/7/8/11/24/8）。新增风险 **R30** 与**附录 K**（本批判据 × 用例映射，含在线残差 **O-21**）；**S4 仍不得宣称完成**——真实 401/402 分类、粘滞观感与端到端验收仍在线 |
 | 0.29 | 2026-09-28 | **新增附录 L「在线执行 runbook（O-01—O-21 与验收记录骨架）」**（维护者批准：落点＝本文附录 L、范围含 O 清单 + 门禁/验收骨架、前置尚未具备故只备件不联调）。把五段在线清单（附录 D.3/F.3.2/I.4/J.3/K.3）与三张前置门（S1-16/S2-10/S3-13）、S4-05—S4-08 的验收要求整理成**可勾选执行件**：勾选语义（勾选＝已执行，通过与否只写结论）、脱敏规则、证据编号（`L-O-xx-n` 等）、六阶段依赖编排（P0—P5，O-10 为总前置）、逐条记录块（步骤/预期逐字引用原清单）与四张记录骨架（门禁/S4-05 评审/S4-06 A01—A19/S4-07 部署/S4-08 终验矩阵）。**判据与任务范围未变**，附录 D—K 为历史快照不改写；O-14、O-16 的源措辞先于后续批次，已在条目下加「注」标明以现行实现为准。真实账号/测试群/DeepSeek 凭据尚未具备——全部条目为"未执行"，**S4 仍不得宣称完成** |
+| 0.30 | 2026-09-28 | **新增附录 M「在线执行准备（环境勘查与待办）」**：为 O-10 做**只读**执行前勘查并记录——本机环境结论（macOS 26.6.2/arm64；QQ 6.9.65 已装未登录；**NapCat 未安装**；AstrBot 检出 4.28.1（`ab42c0d`）与插件软链就绪；无运行时数据；端口 6199/6185 空闲）、AstrBot 配置与启动事实（`platform` 键与 `/ws` 路径、dashboard 默认 `0.0.0.0` 需收回环、`plugin_set` 约束范围、两种启动入口、`.venv/bin/astrbot` shebang 失效的已知问题）、O-10 准备草案、**六条待决策（本次不决定）**与 TODO 清单。**未启动任何服务、未安装任何软件、未做任何决策**；O-10 仍为"未执行"，附录 L 条目与判据一字未改；**S4 仍不得宣称完成** |
 
 ## 0. 状态标记与文档约定
 
@@ -2200,3 +2201,83 @@ S0 离线核验全部通过。
 | G08 人设与安全：角色场景人工评审、提示注入及权限边界 | | |
 
 注：A20 属初始文档阶段，不在本轮复核范围。
+
+> **执行准备**：O-10 的本机环境勘查、AstrBot 配置事实、待决策项与 TODO 见**附录 M**（2026-09-28；未做决策、未执行）。
+
+## 附录 M：在线执行准备（环境勘查与待办，2026-09-28）
+
+**目的**：为附录 L 的 **O-10**（NapCat/QQ/Mac 组合：建立鉴权 OneBot 连接）做执行前准备，把本机环境的**只读勘查结论**、AstrBot 配置与启动的事实核对、以及后续待办固定下来。
+
+**边界（本次未做任何决策、未执行任何在线步骤）**：
+- 未启动任何服务、未安装任何软件、未修改任何运行时配置；**O-10 仍为【未执行】**——附录 L 的条目一字未改、未勾选。
+- 未做任何设计/运维决策——需要维护者拍板的问题集中在 §M.4，本次不选。
+- 凭据、账号、群号一律不写入本文档与仓库（§9.2）。
+- 本附录不构成任何门禁证据；G01/G02 的判定仍以附录 L.6 的在线记录为准。
+
+### M.1 本机环境勘查结论（只读）
+
+| 项 | 复现命令（只读） | 结论 |
+|---|---|---|
+| 系统 / CPU | `sw_vers`；`uname -m` | macOS 26.6.2（build 25G83）；arm64 |
+| QQ 客户端 | `ls /Applications/QQ.app`；读 `Info.plist` | 已安装，版本 **6.9.65**；`~/Library/Application Support/QQ` 不存在 ⇒ 从未登录 |
+| NapCat | `mdfind -name NapCat`；`brew list \| grep -i napcat`；目录列举 | **未安装**（无任何匹配） |
+| AstrBot 检出 | 列 `.runtime/astrbot`；`git -C .runtime/astrbot rev-parse --short HEAD` | 完整检出，版本 4.28.1；提交 `ab42c0d`；含 `main.py` / `astrbot/` / `uv.lock` / `.venv` |
+| 插件加载位 | `ls .runtime/astrbot/data/plugins` | 软链 `astrbot_plugin_chizuru → 仓库插件` 有效（不存在第二份源码） |
+| 运行时数据 | 列 `.runtime/astrbot/data`；`mdfind -name cmd_config.json` | **无** `cmd_config.json`、无会话库；`~/.astrbot` 不存在；`ASTRBOT_ROOT` 未设置 |
+| 端口 | `lsof -nP -iTCP:6199 -sTCP:LISTEN`（同 6185） | OneBot 6199 与 WebUI 6185 均空闲 |
+| 工具链 | `uv --version`；检出内 `python --version` | uv 0.6.10；检出内 Python 3.12.9（系统 `python3` 3.12.6） |
+
+**缺口（执行 O-10 前需补齐）**：NapCat 本体与 QQ 登录；AstrBot 运行时配置（`data/cmd_config.json` 的必关键 + `platform` 条目）；两端一致的 OneBot Token。
+
+### M.2 AstrBot 4.28.1 的配置与启动事实（只读勘查，未经实例验证）
+
+> 以下为**源码级核对**（本次未启动实例验证）；执行时若与实际不符，按"以现行实现为准"记录偏差（同附录 L 的「注」口径）。
+
+| 事项 | 事实 |
+|---|---|
+| 配置文件 | 运行时为单文件 `data/cmd_config.json`（缺文件时用默认配置整体落盘）；插件自身配置在 `data/config/<插件目录名>_config.json` |
+| 平台配置 | `config["platform"]` 为**列表**，元素键 `id` / `type` / `enable` / `ws_reverse_host` / `ws_reverse_port` / `ws_reverse_token`；`aiocqhttp` 的反向 WS 由 AstrBot 侧监听 |
+| 监听与路径 | 默认 `0.0.0.0:6199`（执行时**须改回环**，§9.3）；路径 `/ws`（另有 `/ws/event`、`/ws/api`）；token 经 `Authorization: Token｜Bearer` 校验 ⇒ NapCat 侧填 `ws://127.0.0.1:6199/ws` |
+| Dashboard | 默认 `enable=true`、`host=0.0.0.0`、`port=6185`；**无"仅回环"键**，须显式写 `127.0.0.1`；密码不强制，为空时自动生成随机密码并打印 |
+| 插件集 | `plugin_set` 只约束第三方插件；保留内置插件恒定加载，只能靠附录 D.2 的键关闭其行为 |
+| 启动入口 | `main.py`（检出根）与 `astrbot run`（CLI；需 cwd 有 `.astrbot` 标记——当前检出**没有**，若走 CLI 需先 `astrbot init -y`）；`ASTRBOT_ROOT` 未设时取当前工作目录 |
+| 日志 | 默认 `data/logs/astrbot.log`（`log_file_enable` 默认关，执行时按需打开）；trace 等开关同文件 |
+| 已知问题 | `.venv/bin/astrbot` 的 shebang 指向旧仓库路径（`chizuru/…`，仓库已改名 `chizuru-bot`）⇒ 该入口脚本不可直接用；统一用 `uv run --project .runtime/astrbot --no-sync …` |
+
+### M.3 O-10 执行准备草案（步骤要点，**不含决策**）
+
+按附录 L 的 O-10 记录块与 L.0 的元信息字段执行；准备要点：
+
+1. **配置（AstrBot 侧）**：先让 `data/cmd_config.json` 生成（或按需手工建立），再应用附录 D.2 的 16 行必关配置（注意顶层 `wake_prefix` 与 `provider_settings.wake_prefix` 是**两个键**）；把 `platform` 条目设为 `aiocqhttp` + 回环 host + 非空 token；把 dashboard 收到 `127.0.0.1`。
+2. **启动**：经 `uv run --project .runtime/astrbot --no-sync …` 启动（见 M.2 的已知问题）；确认插件被加载、且只启用本插件。
+3. **NapCat 侧**：按官方 macOS 安装方式安装并启动（版本待记录），登录 QQ（人工），在 OneBot 配置里填**反向 WS**：`ws://127.0.0.1:6199/ws` + 与 AstrBot 一致的 token。
+4. **建连验证（O-10 的预期）**：连接可用；断线与离线可观察。
+5. **留证与回写**：按 L.0 记录元信息（含 QQ/NapCat 版本、执行前后 `run_all.sh` 快照）；留证编号 `L-O-10-n`；执行后在附录 L 的 O-10 条目勾选并写「结论」行。
+
+### M.4 待决策（**本次不决定**）
+
+| 编号 | 问题 | 选项与影响（仅列示，不推荐、不预选） |
+|---|---|---|
+| Q1 | NapCat 的安装方式与执行者 | 选项：官方 macOS 安装包（官方发行页含 MAC 构建）/ 由维护者自行安装；影响：下载来源与版本记录（S4-07 要求 NapCat 与 QQ 版本单独记录）；兼容性仍未验证（架构 §9.1"仍需联调"） |
+| Q2 | 机器人账号与测试群 | 选项：专用小号 / 其它账号；测试群与维护者清单（值**只进运行时配置**，§9.2）；影响：A01、A02、A04、A18 的真实环境部分（O-10 起） |
+| Q3 | D.2 必关配置的落地方式 | 选项：手工编辑 `cmd_config.json` / 一次性脚本改写；影响：可复现性与误改风险（不当改写可能退回默认或破坏既有键） |
+| Q4 | AstrBot 启动入口 | 选项：`main.py` / `astrbot init -y` + `astrbot run`；影响：数据目录与控制方式（CLI 会创建 `.astrbot` 标记与锁文件） |
+| Q5 | WebUI 的安排 | 选项：启用（仅回环）/ 不启用；管理凭据与访问方式（§9.3）；影响：O-19 的管理面暴露面核对 |
+| Q6 | O-10 之后的场次 | 选项：同场次连做 O-01/O-02/O-04（零出站、无需 DeepSeek）/ 分开执行；影响：附录 L 的 P1 编排与留证批次 |
+
+### M.5 TODO 清单
+
+勘查与准备（可勾选；**未执行不得勾选**，与 L.0 勾选语义一致）：
+
+- [x] 只读勘查本机环境（系统 / QQ / NapCat / AstrBot 检出 / 端口 / 工具链）——见 M.1
+- [x] 核对该检出的平台 / dashboard / 插件集 / 启动入口与日志路径（源码级）——见 M.2
+- [ ] 决定 M.4 的 Q1—Q6（由维护者）
+- [ ] 安装 NapCat 并记录版本（待 Q1）
+- [ ] 生成 / 建立 `data/cmd_config.json` 并应用 D.2 必关配置（待 Q3）
+- [ ] 配置 `platform`（aiocqhttp、回环、非空 token）与 dashboard 回环（待 Q3/Q5）
+- [ ] 启动 AstrBot 并确认只加载本插件
+- [ ] 启动 NapCat、登录 QQ（人工）、配置反向 WS 指向 `ws://127.0.0.1:6199/ws`
+- [ ] 执行 O-10 并留证（`L-O-10-n`），在附录 L 勾选与回写结论
+- [ ] （依 Q6）同场次推进 O-01 / O-02 / O-04
+
+**不变式**：本附录不改变附录 L 的任何条目与判据；O-10 与其余条目仍为"未执行"；**S4 不得宣称完成**。
