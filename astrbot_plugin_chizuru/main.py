@@ -18,6 +18,7 @@
 | 队列满 / 等待调度超时（从未开始）：回一次忙碌提示 | `finish` | `cancel` |
 | 调度器已关闭（从未开始） | `release` | `cancel` |
 | 预算拒绝、提供商不可用：回一次暂不可用提示 | `finish` | 未预留 |
+| 粘滞降级已置位（401/402）：回一次暂不可用提示 | `finish` | 未预留 |
 | message_id 不可用 | 不进入去重 | 未预留 |
 | 超业务期限（已开始，无结果）：回一次失败提示 | `finish` | `settle(None)` 按估算 |
 | 正常返回（含已分类的失败与空回复：回一次固定提示） | `finish` | `settle(usage)` |
@@ -56,8 +57,15 @@
   待确认窗口，`记忆 确认开启` 在窗口内同群同人时写入授权行（带说明版本）；`记忆 查看`
   先回附录 C.3 提示、确认后才列出本人记录；`记忆 状态/纠正/删除/关闭` 直接读写本人数据，
   `记忆 关闭` 与 `记忆 删除全部` 等价（先撤权、再清空）。全部经 `FIXED_NOTICE` 出站，
-  因此**暂停群里的删除与关闭仍然可达**（需求 §4.4）。`帮助` 仍不执行（回执文案待审）。
-- 群内出口：`千鹤 状态`、`群上下文 开启`（含确认失败时的重发全文）、记忆类回执与列表、
+  因此**暂停群里的删除与关闭仍然可达**（需求 §4.4）。
+- `帮助`（S1-17）逐字回复 `help_notice.HELP_NOTICE_TEXT`（附录 C.6），同样是 `FIXED_NOTICE`、
+  零模型调用、不写历史、不触发抽取，暂停群里也可达。
+- **401/402 粘滞门禁**（S4-01 离线残差的收口）：`AUTH_FAILED`/`BALANCE_INSUFFICIENT` 首次出现
+  时置 `PROVIDER_DISABLED`/`BUDGET_EXHAUSTED`，此后聊天与抽取都不再发起付费调用，只对有效 @
+  回一次暂不可用提示；维护者从 `千鹤 状态` 的降级行看到原因。**解除只有进程重启/插件重载**
+  （内存标志、不持久化），`_acquire_provider` 的"取到即清除"因此删除——**行为分化**：提供商
+  "后配置好"不再自动恢复，需重载（docs/03 §5.2 有记录）。
+- 群内出口：`千鹤 状态`、`群上下文 开启`（含确认失败时的重发全文）、`帮助`、记忆类回执与列表、
   `@` 后的聊天回复，以及**固定提示**（附件能力、失败、空回复、忙碌、暂不可用、超预算，
   S4-01；文案逐字取自 `fixed_notice.py`，见附录 C.5）。`上下文 退出/加入` 与 S2-05 的
   其余状态变更执行但**静默无回执**。
@@ -112,6 +120,7 @@ from . import (
     context_assembly,
     fixed_notice,
     health,
+    help_notice,
     history,
     llm,
     memory,
@@ -166,6 +175,29 @@ DELETE_ALL_HISTORY_SECONDS = 99_999_999
 **上游把默认值 86400 的语义写反了**：`delete(..., offset_sec)` 删的是"最近 offset 秒内"
 （`db/sqlite.py` 的 SQL 是 `created_at >= now - offset`），默认只清最近 24 小时。
 dashboard 删除会话时用的就是这个超大窗口，本插件沿用它，并在文档里记下该事实。"""
+
+_PAYMENT_ENTRIES: tuple[tuple[redact.ErrorCode, health.Degradation], ...] = (
+    (redact.ErrorCode.AUTH_FAILED, health.Degradation.PROVIDER_DISABLED),
+    (redact.ErrorCode.BALANCE_INSUFFICIENT, health.Degradation.BUDGET_EXHAUSTED),
+)
+"""401/402 与**粘滞降级**的对应表（S4-01 离线残差的收口，架构 §8.3）：第一个元素是
+触发它的故障码，第二个是要置位的降级；顺序即 `_payment_block` 的探测顺序。置位后停用
+全部付费调用（聊天与抽取），直到进程重启或插件重载——`initialize()` 会重建
+`HealthMonitor`，进程内没有第二个解除入口；`千鹤 状态` 的降级行负责"通知维护侧"。"""
+
+
+def _payment_reason(
+    code: redact.ErrorCode | None,
+) -> tuple[health.Degradation, redact.ErrorCode] | None:
+    """故障码 → （要置位的粘滞降级，触发它的码）；其余一律 `None`。
+
+    只认 401/402：429/5xx/超时都是瞬态错误，把它们做成粘滞标志会让"降级永远无法
+    被清除"（`health.Degradation` 的 docstring 已警戒此例）。
+    """
+    for entry_code, reason in _PAYMENT_ENTRIES:
+        if code is entry_code:
+            return reason, entry_code
+    return None
 
 
 @dataclass
@@ -494,8 +526,11 @@ class ChizuruPlugin(Star):
             commands.CommandKind.MEMORY_DISABLE,
         ):
             await self._handle_memory_control(event, facts, settings, services, intent)
+        elif intent.kind is commands.CommandKind.HELP:
+            await self._handle_help(event, facts, settings, services, intent)
         else:
-            # 只剩 `帮助`：回执文案属附录 C 待审范围，执行留待后续任务卡。
+            # 防御分支：`commands.parse` 认识的 kind 已全部有归属，走到这里只可能是
+            # 解析器新增了 kind 而分发漏接——按旧口径记审计，不猜行为。
             self._audit(services, redact.EventCategory.IGNORED)
 
     # ---- 普通群聊采集（S2-03） ----
@@ -562,6 +597,33 @@ class ChizuruPlugin(Star):
         if services.health.degradations() & blocking:
             return None
         return stored
+
+    @staticmethod
+    def _payment_block(
+        services: _Services,
+    ) -> tuple[health.Degradation, redact.ErrorCode] | None:
+        """当前是否被 401/402 的粘滞降级挡住付费调用；返回（原因，审计码）或 ``None``。
+
+        与 `_memory_store` 同一模式：集合取交集，`health` 不新增判定 API。
+        命中即"停用异常提供商调用 / 暂停付费请求及抽取"（架构 §8.3）。
+        """
+        for code, reason in _PAYMENT_ENTRIES:
+            if reason in services.health.degradations():
+                return reason, code
+        return None
+
+    def _mark_payment_degraded(
+        self,
+        services: _Services,
+        reason: health.Degradation,
+        code: redact.ErrorCode,
+    ) -> None:
+        """置位粘滞降级；**首次**置位才写一次审计（重复置位由 `_payment_block` 拦在
+        调用之前，这里再挡一次是为了防御并发事件里的重复置位刷屏）。"""
+        if reason in services.health.degradations():
+            return
+        services.health.set_degraded(reason)
+        self._audit(services, redact.EventCategory.DEGRADATION, code=code)
 
     @staticmethod
     def _sender_nickname(event: AstrMessageEvent) -> str:
@@ -641,6 +703,19 @@ class ChizuruPlugin(Star):
             self._audit(services, redact.EventCategory.GATE_DROP)
             return
 
+        blocked = self._payment_block(services)
+        if blocked is not None:
+            # 401/402 粘滞降级（S4-01）：不再发起任何付费调用，只回一次暂不可用提示。
+            # 与暂停检查同一配对规则用 `finish` 而不是 `release`——该事件已被提示答复，
+            # 同 message_id 重放不重答；新事件照常受理，因此成员仍能看到提示与状态行。
+            _reason, code = blocked
+            self._audit(services, redact.EventCategory.GATE_DROP, code=code)
+            outcome = await self._deliver_fixed(
+                event, facts, settings, services, group, fixed_notice.UNAVAILABLE_NOTICE_TEXT
+            )
+            services.dedup.finish(key, outcome)
+            return
+
         prepared = await self._prepare_chat(event, facts, settings, services, message_id)
         if prepared is None:
             # 固定规则 + 当前输入已超预算：不预留、不调用、不发正文，只回一次缩短提示。
@@ -710,6 +785,11 @@ class ChizuruPlugin(Star):
         if answer.kind is not llm.AnswerKind.TEXT:
             # S4-01：`llm.follow_up` 判定该不该说话，文案由 `fixed_notice` 给出；
             # 未分类的故障没有文案，保持静默（既不猜原因，也不把它说成可重试）。
+            # 401/402 另外置**粘滞降级**：后续付费调用被 `_payment_block` 拦下，
+            # 本条回复的文案维持既有映射不变。
+            hit = _payment_reason(answer.code)
+            if hit is not None:
+                self._mark_payment_degraded(services, *hit)
             notice_text = (
                 fixed_notice.text_for(answer.code)
                 if llm.follow_up(answer) is llm.FollowUp.FIXED_NOTICE
@@ -959,13 +1039,22 @@ class ChizuruPlugin(Star):
         facts: MessageFacts,
         message_id: str,
     ) -> object | None:
-        """取当前提供商；任何失败都收敛为 None（绝不抛出到处理器外）。"""
+        """取当前提供商；任何失败都收敛为 None（绝不抛出到处理器外）。
+
+        取不到提供商的**行为分化**（S4-01 离线残差）：`PROVIDER_DISABLED` 现在只在重启/
+        重载时解除，因此"提供商后配置好"不再自动恢复——门禁在任何取提供商动作之前，
+        标志置位期间这里本就不可达；保留旧的"取到即清除"只会制造第二种语义。
+        """
         try:
             provider = await self.context.get_using_provider_async(event.unified_msg_origin)
         except Exception:
             provider = None
         if provider is None:
-            services.health.set_degraded(health.Degradation.PROVIDER_DISABLED)
+            self._mark_payment_degraded(
+                services,
+                health.Degradation.PROVIDER_DISABLED,
+                redact.ErrorCode.UNCLASSIFIED,
+            )
             self._audit(
                 services,
                 redact.EventCategory.MODEL_CALL,
@@ -973,7 +1062,6 @@ class ChizuruPlugin(Star):
                 parts=(facts.group_id, message_id),
             )
             return None
-        services.health.clear_degraded(health.Degradation.PROVIDER_DISABLED)
         return provider
 
     def _reserve(self, services: _Services, provider: object) -> Reservation | BudgetRefusal:
@@ -1036,6 +1124,10 @@ class ChizuruPlugin(Star):
             # 默认关闭（总开关关闭或预算未配置）：连存储都不读。判定仍由 `memory.admit`
             # 收口，这里只是避免在"从不会抽取"的部署里每轮多读两次库。
             return
+        if self._payment_block(services) is not None:
+            # 401/402 粘滞降级（S4-01）：付费调用已停用，抽取不得例外。静默——标志是在
+            # 置位的那一刻记的 DEGRADATION 审计，这里逐条记录只会把日志淹掉。
+            return
         stored = self._memory_store(services)
         if stored is None:
             return  # 无存储或已降级 = 记忆子系统不可用（R21、S3-11），不是错误
@@ -1087,6 +1179,11 @@ class ChizuruPlugin(Star):
             self._audit(services, redact.EventCategory.TOKEN_USAGE, tokens=result.usage)
         if memory.counts_as_failure(result):
             self._mark_extraction_health(services, failed=True)
+            # 401/402 的粘滞降级在抽取侧同样置位（架构 §8.3：停用提供商调用 / 暂停付费
+            # 请求**及抽取**）——聊天成功后仍有并发事件打付费调用，抽取不得绕过。
+            hit = _payment_reason(result.code)
+            if hit is not None:
+                self._mark_payment_degraded(services, *hit)
         else:
             self._mark_extraction_health(services, failed=False)
         self._write_memory(
@@ -1295,6 +1392,41 @@ class ChizuruPlugin(Star):
             error_count=error_count,
         )
         self._audit(services, redact.EventCategory.PLATFORM_STATE, count=error_count)
+
+    # ---- 控制：帮助（S1-17） ----
+
+    async def _handle_help(
+        self,
+        event: AstrMessageEvent,
+        facts: MessageFacts,
+        settings: Settings,
+        services: _Services,
+        intent: commands.CommandIntent,
+    ) -> None:
+        """成员命令：逐字回复附录 C.6 的使用说明（S1-17）。
+
+        零模型调用、不写互动历史、不触发抽取；经 `FIXED_NOTICE` 出站，因此暂停群里
+        仍然可达（与 `千鹤 状态`、记忆类回执同例）。文案不含任何用户数据，不需要
+        发送前重读修订号。
+        """
+        group = self._group_key(facts)
+        message_id = self._message_id(event)
+        if message_id is None:
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+        key = DedupKey(group=group, message_id=message_id, action=ActionKind.CHAT_REPLY)
+        if services.dedup.begin(key) is not Claim.FIRST:
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+        if not authorize(intent, facts, settings).allowed:
+            # 可信范围内的成员即可（MEMBER 档）；拒绝不发提示，与既有命令同口径。
+            services.dedup.release(key)
+            self._audit(services, redact.EventCategory.IGNORED)
+            return
+        outcome = await self._deliver_fixed(
+            event, facts, settings, services, group, help_notice.HELP_NOTICE_TEXT
+        )
+        services.dedup.finish(key, outcome)
 
     # ---- 控制：上下文 退出 / 加入（S2-04） ----
 

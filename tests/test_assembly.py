@@ -36,11 +36,12 @@ guard = None
 factory = None
 plugin_module = None
 fixed_notice = None
+help_notice = None
 _config_seq = 0
 
 
 def setUpModule():
-    global test_root, guard, factory, plugin_module, fixed_notice
+    global test_root, guard, factory, plugin_module, fixed_notice, help_notice
     resources = ExitStack()
     unittest.addModuleCleanup(resources.close)
     test_root = Path(
@@ -67,6 +68,7 @@ def setUpModule():
     core.astrbot_config["trace_enable"] = False
     plugin_module = importlib.import_module(MODULE_NAME)
     fixed_notice = importlib.import_module("astrbot_plugin_chizuru.fixed_notice")
+    help_notice = importlib.import_module("astrbot_plugin_chizuru.help_notice")
     factory = fakes.EventFactory()
     unittest.addModuleCleanup(_unregister_plugin)
     unittest.addModuleCleanup(_finish_guard)
@@ -391,7 +393,12 @@ class ChatFlowTests(AssemblyTestCase):
         self.assertTrue(event.is_stopped())
         self.assertIsNone(event.get_result())
 
-    async def test_provider_unavailable_gives_one_notice_and_new_events_work(self):
+    async def test_provider_unavailable_is_sticky_until_restart(self):
+        """**行为分化（S4-01 离线残差）**：`PROVIDER_DISABLED` 不再"取到提供商即清除"。
+
+        取不到提供商后的新事件由粘滞门禁拦下——回一次暂不可用提示、不取提供商、不调模型；
+        解除只有进程重启/插件重载（`_acquire_provider` 的自动清除已按设计删除，
+        docs/03 §5.2 有记录）。"""
         await self.start(provider=None)
         first = self.mention("你好", message_id="chat-1")
         delivered = self.sent
@@ -402,20 +409,30 @@ class ChatFlowTests(AssemblyTestCase):
             self.plugin.services.health.degradations(),
         )
 
-        # 已用固定提示答复过的事件不重放；**新**事件照常处理（成员再发一条即重试）。
+        # 已用固定提示答复过的事件不重放。
         replay = self.mention("你好", message_id="chat-1")
         replayed = self.sent
         await self.plugin.on_message(replay)
         self.assertEqual(replayed, [])
+
+        # 即便"之后配置好了提供商"，新事件仍被粘滞门禁拦下（不再尝试取提供商）。
         self.context._provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="回复")])
         second = self.mention("你好", message_id="chat-2")
         resumed = self.sent
         await self.plugin.on_message(second)
-        self.assertEqual([text_of(m) for m in resumed], ["回复"])
-        self.assertNotIn(
+        self.assertEqual([text_of(m) for m in resumed], [fixed_notice.UNAVAILABLE_NOTICE_TEXT])
+        self.assertIn(
             plugin_module.health.Degradation.PROVIDER_DISABLED,
             self.plugin.services.health.degradations(),
         )
+
+        # 重启（终止后用同一路径重建实例）才解除。
+        await self.plugin.terminate()
+        await self.start(provider=fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="回复")]))
+        after = self.mention("你好", message_id="chat-3")
+        resumed = self.sent
+        await self.plugin.on_message(after)
+        self.assertEqual([text_of(m) for m in resumed], ["回复"])
 
     async def test_provider_lookup_error_is_contained(self):
         await self.start(provider_error=AttributeError("Mock(spec=[]) 没有这个方法"))
@@ -636,12 +653,12 @@ class StatusCommandTests(AssemblyTestCase):
         self.assertEqual(provider.calls, [])
 
     async def test_other_commands_are_silent(self):
-        """**行为分化（S2-05 / 3f）**：`群上下文 开启` 已改为回复告知全文（见
-        `MaintainerCommandTests`），记忆类命令已改为有回执（见 `MemoryConsentCommandTests`）；
-        本用例保留其余仍静默的指令。"""
+        """**行为分化（S2-05 / 3f / S1-17）**：`群上下文 开启` 已改为回复告知全文（见
+        `MaintainerCommandTests`），记忆类命令已改为有回执（见 `MemoryConsentCommandTests`），
+        `帮助` 已改为逐字回执（见 `HelpCommandTests`）；本用例保留其余仍静默的指令。"""
         provider = fakes.FakeProvider()
         await self.start(provider=provider, platform=fakes.FakePlatform())
-        for text in ("帮助", "上下文 退出", "千鹤 暂停"):
+        for text in ("上下文 退出", "千鹤 暂停"):
             with self.subTest(command=text):
                 await self.plugin.on_message(self.mention(text, message_id=f"event-{text}"))
                 self.assertEqual(self.sent, [])
@@ -685,6 +702,132 @@ class StatusCommandTests(AssemblyTestCase):
         )
         await self.plugin.on_message(self.mention("千鹤 状态", message_id="status-1"))
         self.assertIn("价目表 已配置", text_of(self.sent[0]))
+
+
+class StickyPaymentGateTests(AssemblyTestCase):
+    """S4-01 离线残差：401/402 的粘滞门禁。
+
+    置位后**不再发起任何付费调用**（聊天与抽取），只对有效 @ 回一次暂不可用提示；
+    解除只有进程重启/插件重载（内存标志、不持久化）。真实 401/402 的分类与观感
+    仍在线（O-16）。"""
+
+    async def test_401_stops_later_paid_calls_until_restart(self):
+        provider = fakes.FakeProvider(script=[fakes.FakeApiError(401, "invalid api key")])
+        await self.start(provider=provider)
+        await self.plugin.on_message(self.mention("你好", message_id="chat-1"))
+        # 首次 401 的提示维持既有映射（4a）：通用失败提示；同时置位粘滞降级。
+        self.assertEqual([text_of(m) for m in self.sent], [fixed_notice.FAILURE_NOTICE_TEXT])
+        self.assertEqual(len(provider.calls), 1)
+        self.assertIn(
+            plugin_module.health.Degradation.PROVIDER_DISABLED,
+            self.plugin.services.health.degradations(),
+        )
+
+        await self.plugin.on_message(self.mention("再问一次", message_id="chat-2"))
+        self.assertEqual([text_of(m) for m in self.sent], [fixed_notice.UNAVAILABLE_NOTICE_TEXT])
+        self.assertEqual(len(provider.calls), 1)
+
+        # 重启/重载才解除：终止后用同一路径重建实例，聊天恢复。
+        await self.plugin.terminate()
+        await self.start(provider=fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="重启后回复")]))
+        await self.plugin.on_message(self.mention("你好", message_id="chat-3"))
+        self.assertEqual([text_of(m) for m in self.sent], ["重启后回复"])
+
+    async def test_402_stops_later_chat_and_extraction(self):
+        provider = fakes.FakeProvider(
+            script=[
+                fakes.FakeLLMResponse(text="嗯，我在。"),
+                fakes.FakeApiError(402, "insufficient balance"),
+            ]
+        )
+        await self.start_extraction(provider=provider)
+        await self.plugin.on_message(self.mention("叫我小林就好", message_id="m-1"))
+        # 聊天 + 抽取各一次；抽取的 402 置位降级，已送达的回复不受影响。
+        self.assertEqual(len(provider.calls), 2)
+        self.assertEqual([text_of(m) for m in self.sent], ["嗯，我在。"])
+        self.assertIn(
+            plugin_module.health.Degradation.BUDGET_EXHAUSTED,
+            self.plugin.services.health.degradations(),
+        )
+
+        # 下一条 @ 被门禁拦下：不聊天、不抽取（付费调用保持停用）。
+        await self.plugin.on_message(self.mention("还在吗", message_id="m-2"))
+        self.assertEqual([text_of(m) for m in self.sent], [fixed_notice.UNAVAILABLE_NOTICE_TEXT])
+        self.assertEqual(len(provider.calls), 2)
+        self.assertEqual(self.memory_facts(), ())
+
+    async def test_extraction_401_disables_the_provider_for_later_chats(self):
+        """抽取也是付费调用：抽取侧的 401 同样置位粘滞降级（架构 §8.3）。"""
+        provider = fakes.FakeProvider(
+            script=[
+                fakes.FakeLLMResponse(text="嗯，我在。"),
+                fakes.FakeApiError(401, "invalid api key"),
+            ]
+        )
+        await self.start_extraction(provider=provider)
+        await self.plugin.on_message(self.mention("叫我小林就好", message_id="m-1"))
+        self.assertEqual(len(provider.calls), 2)
+        self.assertIn(
+            plugin_module.health.Degradation.PROVIDER_DISABLED,
+            self.plugin.services.health.degradations(),
+        )
+
+        await self.plugin.on_message(self.mention("你好", message_id="m-2"))
+        self.assertEqual([text_of(m) for m in self.sent], [fixed_notice.UNAVAILABLE_NOTICE_TEXT])
+        self.assertEqual(len(provider.calls), 2)
+
+    async def test_control_commands_and_help_stay_reachable_while_gated(self):
+        provider = fakes.FakeProvider(script=[fakes.FakeApiError(401, "invalid api key")])
+        await self.start(provider=provider, platform=fakes.FakePlatform())
+        await self.plugin.on_message(self.mention("你好", message_id="chat-1"))
+
+        await self.plugin.on_message(self.mention("千鹤 状态", message_id="status-1"))
+        self.assertIn("提供商已停用（鉴权失败）", text_of(self.sent[0]))
+
+        await self.plugin.on_message(self.mention("帮助", message_id="help-1"))
+        self.assertEqual(text_of(self.sent[0]), help_notice.HELP_NOTICE_TEXT)
+        self.assertEqual(len(provider.calls), 1)
+
+
+class HelpCommandTests(AssemblyTestCase):
+    """S1-17：`帮助` 回执——逐字、零模型调用、不写历史、暂停可达、不重复。"""
+
+    async def test_help_replies_verbatim_without_model_calls_or_history(self):
+        provider = fakes.FakeProvider(script=[fakes.FakeLLMResponse(text="不该发生")])
+        store = fakes.FakeHistoryStore()
+        await self.start(provider=provider, history_store=store, platform=fakes.FakePlatform())
+        await self.plugin.on_message(self.mention("帮助", message_id="help-1"))
+        self.assertEqual([text_of(m) for m in self.sent], [help_notice.HELP_NOTICE_TEXT])
+        self.assertEqual(provider.calls, [])
+        self.assertEqual(store.saves, [])
+        self.assertEqual(self.plugin.services.dedup.stats().in_flight, 0)
+
+    async def test_help_is_reachable_while_paused(self):
+        provider = fakes.FakeProvider()
+        await self.start(
+            provider=provider,
+            storage_path=self.new_storage_path(),
+            history_store=fakes.FakeHistoryStore(),
+        )
+        self.open_group()
+        self.plugin.services.storage.groups.set_paused(self.group_key(), paused=True)
+        await self.plugin.on_message(self.mention("帮助", message_id="help-paused"))
+        self.assertEqual([text_of(m) for m in self.sent], [help_notice.HELP_NOTICE_TEXT])
+        self.assertEqual(provider.calls, [])
+
+    async def test_help_replay_is_not_repeated(self):
+        await self.start(provider=fakes.FakeProvider())
+        await self.plugin.on_message(self.mention("帮助", message_id="help-1"))
+        self.assertEqual(len(self.sent), 1)
+        await self.plugin.on_message(self.mention("帮助", message_id="help-1"))
+        self.assertEqual(self.sent, [])
+
+    async def test_plain_member_in_allowed_group_can_use_help(self):
+        provider = fakes.FakeProvider()
+        await self.start(provider=provider)
+        await self.plugin.on_message(self.mention("帮助", message_id="help-member", sender_id="30002"))
+        self.assertEqual([text_of(m) for m in self.sent], [help_notice.HELP_NOTICE_TEXT])
+        self.assertEqual(provider.calls, [])
 
 
 class LifecycleAndStructureTests(AssemblyTestCase):

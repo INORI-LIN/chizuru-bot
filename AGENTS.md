@@ -25,7 +25,7 @@
 | S1 基础连接与严格 @ | `S1-01`—`S1-15` 的**离线部分**【已完成】；`S1-16` 阶段门【阻塞·在线/凭据】，**未通过** |
 | S2 群上下文 | `S2-01`—`S2-09` 的**离线部分**【已完成】；`S2-10` 门禁记录见附录 F，**结论为未通过** |
 | S3 授权记忆 | `S3-01/02/05—12` 与 **`S3-03`/`S3-04`** 的**离线部分**【已完成】（批次 3a—3f，判据映射见附录 G 与附录 H）；`S3-13` 不排期 |
-| S4 运行与验收 | **进行中（离线先行，批次 4a + 4b）**：`S4-01`/`S4-02` 的**离线部分**【已完成】（固定提示接线 + `model_prices` 价目表来源 + 队列/期限/去重不变量；判据映射见附录 I）；`S4-03`/`S4-04` 的**离线部分**【已完成】（清理失败登记升 schema v3 并跨重启保留 + `check_audit.py` 结构审计；判据映射见附录 J）；`S4-05`—`S4-07` 未开始/阻塞，`S4-08` 阶段门未通过 |
+| S4 运行与验收 | **进行中（离线先行，批次 4a + 4b + 4c-离线）**：`S4-01`/`S4-02` 的**离线部分**【已完成】（固定提示接线 + `model_prices` 价目表来源 + 队列/期限/去重不变量；判据映射见附录 I）；`S4-03`/`S4-04` 的**离线部分**【已完成】（清理失败登记升 schema v3 并跨重启保留 + `check_audit.py` 结构审计；判据映射见附录 J）；**`S4-01` 的离线残差【已完成】**（401/402 粘滞门禁：置位后聊天与抽取都不再发起付费调用，解除只有进程重启/重载；判据映射见附录 K）与 **`S1-17`**【已完成·离线部分】（`帮助` 回执，文案见附录 C.6）；`S4-05`—`S4-07` 未开始/阻塞，`S4-08` 阶段门未通过 |
 
 - **`S1-16` / `S2-10` / `S3-13` / `S4-08` 四个阶段门均未记录通过 → 不得宣称任何阶段完成**；
   也不得把“离线测试全绿”当作验收通过（docs/03 §10）。**S4 离线先行**的决定与边界见 docs/03 §9.7：
@@ -33,10 +33,10 @@
 - **生产默认关闭**：采集需维护者在运行时配置里填入允许群与维护者，并完成一次两步开启；
   记忆需**成员本人两步确认**（`记忆 开启` → `记忆 确认开启`；2026-09-23 起 `set_authorized` 有了唯一的合法生产入口），
   且自动抽取还需先配置预算金额。**不得手工写库充当验收证据**（R24）。
-- **下一步合法工作只有两类**：① 具备真实账号/测试群/DeepSeek 凭据后执行在线清单（附录 D.3 的 O-01—O-10 + 附录 F.3.2 的 O-11—O-15 + 附录 I.4 的 O-16—O-17）；
+- **下一步合法工作只有两类**：① 具备真实账号/测试群/DeepSeek 凭据后执行在线清单（附录 D.3 的 O-01—O-10 + 附录 F.3.2 的 O-11—O-15 + 附录 I.4 的 O-16—O-17 + 附录 J.3 的 O-18—O-20 + 附录 K.3 的 O-21）；
   ② 在线证据齐备后推阶段门与 S4 剩余卡（`S1-16` → `S2-10` → `S3-13` → `S4-05`—`S4-08`）。
-  **S1/S2/S3 的离线面已全部收口，S4 的 4a（S4-01/S4-02）与 4b（S4-03/S4-04）离线部分已完成；离线侧暂无已授权的下一批任务卡**——
-  开工新批次（如 4c 的 S4-05 人设评审，属【待审·在线】）需维护者再次授权与批次前决定。
+  **S1/S2/S3 的离线面已全部收口，S4 的 4a（S4-01/S4-02）、4b（S4-03/S4-04）与 4c-离线（S4-01 粘滞门禁残差 + S1-17 `帮助` 回执）离线部分已完成；离线侧暂无已授权的下一批任务卡**——
+  开工新批次（如 `S4-05` 人设评审，属【待审·在线】；该批次在 docs/03 §4.2 的计划里记作 4c，与已完成的离线批次「4c-离线」区分）需维护者再次授权与批次前决定。
 - **明令禁止的“捷径”**：为让抽取跑起来而填入预算金额（docs/03 §9.6）；手工写授权行（R24）；
   把插件加载进混有其他插件的在线实例（架构 §14.4）；为推进度弱化验收判据。
 
@@ -58,7 +58,7 @@ export ASTRBOT_BUILD_DASHBOARD=0   # 阻止上游构建钩子运行 npm
 ```
 
 ```sh
-# 全量离线核验：8 个核验脚本 + 全部单元测试（当前共 789 项单元测试）
+# 全量离线核验：8 个核验脚本 + 全部单元测试（当前共 803 项单元测试）
 bash scripts/s0/run_all.sh
 
 # 只跑全部单元测试
@@ -80,7 +80,7 @@ env -u VIRTUAL_ENV uv run --project "$PWD/.runtime/astrbot" --no-sync --offline 
 
 `run_all.sh` 的顺序：`check_env`(S0-01) → `check_outbound`(S0-06) → `check_gating`(S0-02) →
 `check_collect`(S0-03) → `check_temp`(S0-04) → `check_history`(S0-05) → `check_single_call`(S1-10) →
-`check_audit`(S4-04) → `unittest discover`。**“全绿” = 8 个脚本各自 exit 0（内部打印 `N/M PASS`）+ 789 项单测全部通过**；任一失败即非全绿。
+`check_audit`(S4-04) → `unittest discover`。**“全绿” = 8 个脚本各自 exit 0（内部打印 `N/M PASS`）+ 803 项单测全部通过**；任一失败即非全绿。
 
 环境与锁一致性（S0-01 判据，改动环境后必须复核）：
 
@@ -133,13 +133,14 @@ OneBot 事件 → main.py（唯一框架入口、薄适配，提取 MessageFacts
 
 | 模块 | 职责 | 必须不做 |
 |---|---|---|
-| `main.py` | Star 生命周期、钩子注册（**只注册 `on_message`**）、唯一装配点与出站路径 `_deliver()`；普通群聊采集分支与 `上下文 退出/加入`；告知两步开启与维护者命令；**记忆授权两步、记忆命令面**；聊天装配、修订号复核与历史写回 | 不写业务规则、不解析身份、不直接 `event.send`（出站必经 `send_gate`）；采集不落盘、不发消息、不调模型；历史写失败不置持久降级、不影响已送达回复；群开关读策略失败按未暂停放行（R21） |
+| `main.py` | Star 生命周期、钩子注册（**只注册 `on_message`**）、唯一装配点与出站路径 `_deliver()`；普通群聊采集分支与 `上下文 退出/加入`；告知两步开启与维护者命令；**记忆授权两步、记忆命令面**；**`帮助` 回执与 401/402 粘滞门禁**（置位后聊天与抽取都不再发起付费调用，解除只有重启/重载）；聊天装配、修订号复核与历史写回 | 不写业务规则、不解析身份、不直接 `event.send`（出站必经 `send_gate`）；采集不落盘、不发消息、不调模型；历史写失败不置持久降级、不影响已送达回复；群开关读策略失败按未暂停放行（R21） |
 | `config.py` | fail-closed 配置模型：任一字段缺失或畸形 → 整体退回哨兵 `Settings()`（拒绝全部） | 不默认开启采集/记忆；密钥不进 `repr` |
 | `policy.py` | 纯触发形态分类：`IGNORE` / `EMPTY_OR_UNSUPPORTED` / `UNSUPPORTED_ATTACHMENT` / `TEXT_CANDIDATE`；`is_trusted_scope` 是权限与触发**共用的唯一谓词** | 不判权限、不读 DB、不判采集资格、不做指令分流；`UNSUPPORTED_ATTACHMENT` 的固定提示**装配层尚未接线** |
 | `context_assembly.py` | 人格分层与静态规则 + 动态材料与记忆块装配：`STATIC_RULES`/`PERSONA_VERSION`/`build_chat_plan()`；`render_materials()`、`trim_to_budget()`（8192 预算；先丢群聊材料、再丢记忆行、最后丢历史；无法裁剪即返回 `None` 拒绝）；固定规则只进 system | 不组装上下文材料以外的东西、不调模型、不接受事件对象（因而读不到 `message_str`）、不导入框架（临时标记由 `main.py` 施加） |
 | `history.py` | `@` 互动历史：`_at` 私有键、成对解析（不合格条目保守丢弃）、20 轮/24 小时取严、`flatten()` 剥离私有键、`storage_entries()` 写回形状、`should_record()`（送达 ∧ 非记忆辅助轮）、`trim_stored()`（启动裁剪只动 `_at` 成对条目） | 不导入框架、不做 IO、不判权限、不复制全历史（存储归框架会话存储）；裁剪不误删框架条目 |
 | `notice.py` | 群告知文案与两步确认窗口：`NOTICE_TEXT`/`NOTICE_VERSION`（附录 C.1 逐字 + 指纹）、每群单槽 5 分钟窗口（换人即作废、有界、惰性淘汰）、`describe_policy()` 状态行 | 不导入框架/sqlite/asyncio、不做 IO、不调模型、不发消息、不判权限、不读配置（版本由调用方传入） |
 | `fixed_notice.py` | 固定提示文案（S4-01）：`FIXED_NOTICE_VERSION`（附录 C.5 逐字 + 规范串指纹）、六条常量、`text_for(code)` 映射 | 不导入框架/sqlite/asyncio/`llm`、不做 IO、不调模型、不发消息、不判权限、不读配置、不拼装用户数据；未知错误码没有文案 |
+| `help_notice.py` | `帮助` 回执文案（S1-17）：`HELP_NOTICE_VERSION`（附录 C.6 逐字 + SHA-256 指纹）、`HELP_NOTICE_TEXT`；测试同时钉住"与 `commands.COMMAND_TEXTS` 逐字对齐" | 不导入框架/sqlite/asyncio/`llm`/`logging`、不做 IO、不调模型、不发消息、不判权限、不读配置、不拼装用户数据 |
 | `keys.py` | `BotInstanceKey` / `GroupKey` / `MemberKey`、`RevisionSnapshot`；只由可信元数据构造，缺一段即构造失败 | 不用昵称/群名/正文构造键 |
 | `commands.py` | 纯解析 `CommandIntent` + 所需权限档；空白归一化 | 不核权、不执行、不调模型；**调用前提是调用方已确认真实 @**；未知文本返回 `None` |
 | `control.py` | 确定性授权：可信身份 + 显式配置映射 | 不读事件对象、不导入框架、不调模型；QQ 群管理员 ≠ 系统管理员 ≠ 维护者 |
@@ -155,21 +156,25 @@ OneBot 事件 → main.py（唯一框架入口、薄适配，提取 MessageFacts
 | `llm.py` | 请求成形（`LLMRequestPlan`，键集固定、无工具参数）、回复解释（只读 `role`/`completion_text`）、错误分类、≤1 次重试判定（共用同一 `Deadline`）、usage 映射、`FollowUp` 类别 | 不发送、不导入框架、不建网关/客户端；不组装人格与上下文；不读写历史与存储；**不读取推理字段、不追加工具**；不含任何群内文案；**在线部分未验证** |
 
 **已实现但要注意**：记忆授权与命令面（`S3-03`/`S3-04`，2026-09-23 批次 3f）已接线，文案见附录 C.2/C.3 与 `memory/consent.py`；
-仍未实现的只剩 `帮助` 的回执（文案待审，执行留待后续任务卡）。
+`帮助` 回执（`S1-17`，2026-09-28 批次 4c-离线）与 401/402 粘滞门禁（`S4-01` 离线残差，同批）已接线，文案见附录 C.6 与 `help_notice.py`——
+**命令面已无"只记审计不执行"的指令**。
 docs/03 §3.2 的目录树是**拟议结构 + 【已实现】标注**的混合；判断某文件是否存在请直接看仓库。
 
 ### 4.3 框架装配事实（已核验）
 
-- **唯一 handler**：`main.py:427-429`，`@filter.platform_adapter_type(AIOCQHTTP)` + `@filter.event_message_type(ALL, priority=1000)`；
-  收口三件套 `stop_event() + clear_result() + should_call_llm(True)` 在 `main.py:434-436`（K1/K5）。
-- **唯一出站**：`_deliver()`（`main.py:2123`），出站前必过 `send_gate.evaluate`，`event.send` 抛异常即 `SEND_UNCERTAIN` 且**不重发**（唯一 `event.send` 调用在 `main.py:2167`）。
-  三个包装出口：`_deliver_notice`（`main.py:1470`，告知全文）、`_deliver_memory`（`main.py:1907`，记忆类回执）、
-  `_deliver_fixed`（`main.py:1932`，**固定提示**，S4-01，固定 `FIXED_NOTICE + llm_invoked=False + revision=None`）。
+- **唯一 handler**：`main.py:459-461`，`@filter.platform_adapter_type(AIOCQHTTP)` + `@filter.event_message_type(ALL, priority=1000)`；
+  收口三件套 `stop_event() + clear_result() + should_call_llm(True)` 在 `main.py:466-468`（K1/K5）。
+- **唯一出站**：`_deliver()`（`main.py:2255`），出站前必过 `send_gate.evaluate`，`event.send` 抛异常即 `SEND_UNCERTAIN` 且**不重发**（唯一 `event.send` 调用在 `main.py:2299`）。
+  三个包装出口：`_deliver_notice`（`main.py:1602`，告知全文）、`_deliver_memory`（`main.py:2039`，记忆类回执）、
+  `_deliver_fixed`（`main.py:2064`，**固定提示与 `帮助` 回执**，S4-01/S1-17，固定 `FIXED_NOTICE + llm_invoked=False + revision=None`）。
 - **群内用户可见输出穷举**：① `千鹤 状态`（既有报告 + 一行群上下文状态 + 金额已配置时的价目表行）；② `群上下文 开启` 与确认失败时的重发全文（附录 C.1 逐字）；
   ③ `记忆 开启` 与确认失败时的重发全文（附录 C.2 逐字）、`记忆 查看` 的提示（附录 C.3 逐字）与确认后的列表、其余记忆命令的回执；
-  ④ `@` 后的模型聊天回复；⑤ **固定提示**（附录 C.5 逐字）：附件能力、超预算、失败、空回复、忙碌、暂不可用。
+  ④ **`帮助` 的逐字使用说明**（附录 C.6，S1-17）；⑤ `@` 后的模型聊天回复；⑥ **固定提示**（附录 C.5 逐字）：附件能力、超预算、失败、空回复、忙碌、暂不可用。
   **静默无回执**：`上下文 退出/加入`、`群上下文 关闭`、`上下文 清空`、`千鹤 暂停/恢复`（执行状态变更）；
-  未分类的故障与修订变化导致的在途丢弃也静默。**不执行只记审计**：`帮助`。
+  未分类的故障与修订变化导致的在途丢弃也静默。**没有"只记审计不执行"的命令**（`帮助` 于 2026-09-28 落地）。
+- **401/402 粘滞门禁**（S4-01 离线残差，2026-09-28）：`main._payment_block` 在聊天装配前、抽取准入前拦下付费调用；
+  首次 `AUTH_FAILED`/`BALANCE_INSUFFICIENT` 置 `PROVIDER_DISABLED`/`BUDGET_EXHAUSTED`（首次写一条 `EventCategory.DEGRADATION` 审计），
+  `千鹤 状态` 的降级行给出原因；**解除只有进程重启/插件重载**，`_acquire_provider` 的"取到即清除"已删除（行为分化见 docs/03 §5.2 D34）。
 - **清理失败跨重启可见**（S4-03，R23）：群级删除失败的次数与时间落在 `storage.maintenance`（`cleanup_failure` 表，schema v3），
   启动读回计数与 `DELETION_FAILED`（记忆相关能力保持停用），`千鹤 状态` 的「清理失败：N 次」行因此不随重启消失；
   一次**成功**的重跑（`上下文 清空`/`群上下文 关闭`/`上下文 退出`）按该群登记数扣减，最后一条清除时才解除降级。
@@ -177,7 +182,7 @@ docs/03 §3.2 的目录树是**拟议结构 + 【已实现】标注**的混合�
   两者都不进 system 且受同一 8192 预算裁剪；`_no_save` 另行处理整轮排除（K6）。
 - **配置生效时机**：`limits`、`budget`（含**价目表 `model_prices`**，S4-01）与两个记忆确认窗口（取 `memory.auth_confirm_ttl_seconds`）在 `initialize()` 时固定
   （运行时改动需重载插件）；身份、允许群、维护者映射与金额开关**每个事件重读**。
-- **测试注入点**（`main.py:268-279`）：`clock` / `datetime_clock` / `redactor_salt` / `storage_path` /
+- **测试注入点**（`main.py:300-310`）：`clock` / `datetime_clock` / `redactor_salt` / `storage_path` /
   `history_cleaner` / `history_store` / `price_table`——`price_table` 注入时优先于配置；生产由 `model_prices` 构造，未配置即空价目表（R20）。
 
 ### 4.4 不可违背的硬约束
@@ -232,17 +237,18 @@ docs/03 §3.2 的目录树是**拟议结构 + 【已实现】标注**的混合�
 | `CONSENT_VERSION` / `CONSENT_TEXT` | `consent-1` / 附录 C.2 逐字（2026-09-23 定稿） | `memory/consent.py` | SHA-256 `c8262dee04ae00bde436cd7533b941e1a3446b3be33c6cb017dded2a8ce706ff`（`tests/test_memory_consent.py`） |
 | `VIEW_NOTICE_VERSION` / `VIEW_NOTICE_TEXT` | `memory-view-1` / 附录 C.3 逐字（同上定稿） | `memory/consent.py` | SHA-256 `93bb8a55d1a45c0d26ce28b0ee8ddcb8c1347a62f3d60e7ed6756609dad2d189`（同上） |
 | `FIXED_NOTICE_VERSION` / 六条固定提示 | `fixed-notice-1` / 附录 C.5 逐字（2026-09-23 定稿） | `fixed_notice.py` | 规范串（按常量名升序 `名称=文本` 以换行连接）SHA-256 `ca30978801c72731ef479b615f1ab2a85788a4337a08e3c63aa87756034af8e4`（`tests/test_fixed_notice.py`） |
+| `HELP_NOTICE_VERSION` / `HELP_NOTICE_TEXT` | `help-notice-1` / 附录 C.6 逐字（2026-09-28 定稿） | `help_notice.py` | 规范串（`名称=文本`）SHA-256 `8d1b263efd38cc191a51ddc69cd075570acef8895b2833d7cbf0cf53c72aceb6`（`tests/test_help_notice.py`） |
 | `SCHEMA_VERSION` | `3`（六张 STRICT 表） | `storage/schema.py:25` | 升版用例（`tests/test_storage_db.py`，含 v2 → v3） |
 
 改动流程：① 递增版本字面量（如 `persona-2`）；② 同步测试内 SHA-256/字面量；③ 在 docs/03 记录理由——
-三者缺一不可。附录 C.1/C.2/C.3 均已定稿：`NOTICE_TEXT` 不得再改字（改了必须重新告知）；
+三者缺一不可。附录 C.1/C.2/C.3/C.5/C.6 均已定稿：`NOTICE_TEXT` 不得再改字（改了必须重新告知）；
 `CONSENT_TEXT` 递增会让已授权成员回到未授权、必须重新确认（**R27**）。
 
 ### 6.2 待审清单（写出前先问维护者；不要在代码或回复里替它定稿）
 
-- **群内回执/提示文案**：附录 C.1/C.2/C.3/C.5 已定稿并逐字入库（C.5 固定提示随批次 4a 定稿）；
-  **仍未定稿的只有 `帮助` 的回执**（当前只记审计）与 `上下文 退出/加入`、`群上下文 关闭`、`上下文 清空`、
-  `千鹤 暂停/恢复` 的静默执行（执行状态变更、无回执文案）。
+- **群内回执/提示文案**：附录 C.1/C.2/C.3/C.5/C.6 已定稿并逐字入库（C.5 固定提示随批次 4a、C.6 `帮助` 回执随批次 4c-离线定稿）；
+  **不再有未定稿的群内回执文案**；`上下文 退出/加入`、`群上下文 关闭`、`上下文 清空`、`千鹤 暂停/恢复` 保持静默执行
+  （执行状态变更、无回执文案——这是既定设计，不是待办）。
 - **模型可见文本**：`EXTRACTION_RULES`（待审初稿）、`MEMORY_BLOCK_TITLE`（待评审）、
   `MATERIAL_TITLE`；类别名已随 3f 按需求 §4.3 原文定稿（群内列表与注入块共用同一份）。
 - **维护者可见新文案**：`notice.describe_policy`（`notice.py:170`）、`main._describe_group`（`main.py:1130` 附近）、
@@ -282,7 +288,7 @@ docs/03 §3.2 的目录树是**拟议结构 + 【已实现】标注**的混合�
 
 - 测试用标准库 `unittest`，无 pytest/conftest。**必须在仓库根目录运行**：测试以顶层包名
   `astrbot_plugin_chizuru.*` 导入模块，靠 `python -m` 把 CWD 放进 `sys.path`。
-- 规模：**29 个测试模块、789 项用例**；`tests/fakes.py` 不是测试模块（不匹配 `test*.py`），
+- 规模：**30 个测试模块、803 项用例**；`tests/fakes.py` 不是测试模块（不匹配 `test*.py`），
   也不要 import `scripts/s0/`。
 - `tests/test_plugin.py` 使用**真实** AstrBot 框架对象（导入 AstrBot、解析 `metadata.yaml`、
   注入 `_conf_schema.json`、经 `call_handler` 复刻 `star_request.py` 的处理器调用循环）；
@@ -322,7 +328,7 @@ docs/03 §3.2 的目录树是**拟议结构 + 【已实现】标注**的混合�
 | `policy.py:28` | ~~称附件档“可回复固定的文本能力提示”——装配层从不发~~ **2026-09-23（批次 4a）已接线**：`main._handle_attachment` 经 `_deliver_fixed` 回一次能力提示；此条不再是过时注释 |
 | `main.py` 的 `_deliver` 内 `GateFacts.previous=None` | `DropReason.SEND_UNCERTAIN` 分支在生产装配中不可达——去重层已在入口拦截重放；**批次 4a 复核后确认不改**（开启它需要跨事件保存发送结论，属新的状态设计） |
 | `llm.py:377-401` | ~~`FollowUp` / `follow_up()` 无任何生产调用~~ **2026-09-23（批次 4a）已接线**：`main._handle_chat` 用 `follow_up` 判定该不该给固定提示；`background=True 恒 NOTHING` 仍是单元级护栏 |
-| `redact.py:75` | `EventCategory.DEGRADATION` 全仓库零引用（`health.py` 的 `_DEGRADATION_TEXT` 是另一物） |
+| `redact.py:75` | ~~`EventCategory.DEGRADATION` 全仓库零引用~~ **2026-09-28（批次 4c-离线）已转正**：`main._mark_payment_degraded` 在 401/402 首次置位时各写一条；`health.py` 的 `_DEGRADATION_TEXT` 仍是另一物 |
 | `budget.py`、`redact.py`、`notice.py` | `settle(cost=…)`、`NoticeGate.stats` 等公开 API 未接线，供测试与包内复用；`AUDIT_CHECKLIST` 自批次 4b 起由 `scripts/s0/check_audit.py` 输出（框架侧人工审计清单），`RetentionPolicy` 仍只被测试消费 |
 
 以下不一致**结论为误判，不要据此改代码**：曾怀疑 `main.py:37` 的裁剪顺序注释与 `context_assembly.trim_to_budget`
@@ -360,3 +366,17 @@ docs/03 §3.2 的目录树是**拟议结构 + 【已实现】标注**的混合�
 3. `docs/03` 升至 0.27：任务卡状态（S4-03/S4-04 离线部分）、§5.2 的 D27—D32、§9.8（4b 授权决定）、
    §8 的 R23 状态与新增 **R29**、**附录 J**（含在线编号 **O-18—O-20**）；`docs/02` 升至 0.14 并新增 §14.9。
 4. `AUDIT_CHECKLIST` 自本批起由 `check_audit.py` 输出（§9.2 已回写）；`RetentionPolicy`、`NoticeGate.stats` 等其余未接线 API 状态不变。
+
+### 9.6 批次 4c-离线落地后的回写（2026-09-28）
+
+1. `main.py` 新增 **401/402 粘滞门禁**（`_PAYMENT_ENTRIES` / `_payment_reason` / `_payment_block` / `_mark_payment_degraded`）与
+   **`_handle_help`**；新增 `help_notice.py`（`help-notice-1` + 逐字全文，附录 C.6）；`main.py` 行号再次下移，本文件已同步
+   （唯一 handler `:459-461`、收口 `:466-468`、`_deliver` `:2255`、`event.send` `:2299`、测试注入点 `:300-310`）。
+2. `docs/03` 升至 0.28：任务卡（**新增 S1-17**、S4-01 补记 4c-离线）、§5.2 的 **D33—D39**、§9.9（本批授权决定）、
+   §8 新增 **R30**、**附录 C.6** 与**附录 K**（含在线编号 **O-21**）；`docs/02` 升至 0.15 并新增 §14.10（§8.3 的 401/402 两行同步粘滞语义）。
+3. 测试规模 **30 模块 / 803 项**（新增 `tests/test_help_notice.py` 6 项、`test_assembly.py` 的 `StickyPaymentGateTests` 4 与 `HelpCommandTests` 4，改写 2 项）；
+   `run_all.sh` 仍是 8 脚本全绿（10/15/12/7/8/11/24/8）。
+4. `EventCategory.DEGRADATION` 转正（§9.2 已回写）；`README.md` 的 S4 行、目录树、测试数、"`帮助` 仍不执行"与
+   "清理失败计数不跨重启"（4b 遗留笔误）一并回改。
+5. **行为分化 2 处**：`_acquire_provider` 的"取到即清除"删除（提供商"后配置好"需重载）、`帮助` 由静默改为逐字回执；
+   既有用例的改写与理由见 docs/03 §5.2 **D38**，**未放宽任何既有断言**。
